@@ -1,0 +1,73 @@
+[workspace]
+members = [
+    "crates/server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+strip = "symbols"
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+# ============================================================================
+# Workspace-wide dependency declarations
+# Single source of truth — all crates reference via `workspace = true`.
+# ============================================================================
+
+[workspace.dependencies]
+# --- Async runtime ---
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# --- Web framework ---
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+
+# --- Serde ecosystem ---
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# --- HTTP client ---
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+
+# --- Database ---
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# --- Time ---
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- Error handling ---
+anyhow = "1.0"
+thiserror = "2.0"
+
+# --- Logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "fmt",
+    "json",
+] }
+
+# --- Utilities ---
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+parking_lot = "0.12"
+dirs-next = "2"
+url = "2"
+sha2 = "0.10"
+semver = "1"
+clap = { version = "4", features = ["derive"] }
+
+# --- Build / Test ---
+tempfile = "3"
