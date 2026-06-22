@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AGENT.SITES / CONTROL</title>
+<style>
+  :root {
+    --paper: #f4f1ea;
+    --ink: #0a0a0a;
+    --accent: #c8102e;
+    --muted: #6b6b6b;
+    --rule: #0a0a0a;
+    --ok: #00661a;
+    --warn: #b86c00;
+    --err: #c8102e;
+    --cell: rgba(10,10,10,0.04);
+    --cell-hot: rgba(200,16,46,0.08);
+    --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, "Times New Roman", serif;
+    --mono: "SF Mono", "JetBrains Mono", "IBM Plex Mono", "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0b0b0a;
+      --ink: #f5f1e6;
+      --accent: #ff4d6a;
+      --muted: #8a8a82;
+      --rule: #f5f1e6;
+      --ok: #66d97a;
+      --warn: #d9a441;
+      --err: #ff4d6a;
+      --cell: rgba(245,241,230,0.05);
+      --cell-hot: rgba(255,77,106,0.16);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    min-height: 100vh;
+    padding: 0 0 6rem;
+  }
+
+  /* Top double-rule banner */
+  .banner {
+    border-bottom: 3px double var(--rule);
+    border-top: 3px double var(--rule);
+    padding: 1.2rem 1.5rem;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: end;
+    gap: 1rem;
+  }
+  .banner h1 {
+    margin: 0;
+    font-family: var(--serif);
+    font-weight: 900;
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    letter-spacing: -0.02em;
+    line-height: 1;
+    font-style: italic;
+  }
+  .banner h1 .slash {
+    color: var(--accent);
+    font-style: normal;
+    margin: 0 0.1em;
+  }
+  .banner h1 .ctl {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 0.55em;
+    font-style: normal;
+    letter-spacing: 0.18em;
+    display: inline-block;
+    transform: translateY(-0.4em);
+    color: var(--ink);
+  }
+  .banner .meta {
+    text-align: right;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+  }
+  .banner .meta strong { color: var(--ink); font-weight: 700; }
+  .banner .meta .live {
+    display: inline-block;
+    width: 7px; height: 7px;
+    background: var(--ok);
+    border-radius: 50%;
+    margin-right: 0.4em;
+    animation: blink 2s steps(2, start) infinite;
+  }
+  .banner .meta .live.paused { background: var(--muted); animation: none; }
+  @keyframes blink { 50% { opacity: 0.3; } }
+
+  /* Toolbar: refresh + interval */
+  .toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.6rem 1.5rem;
+    border-bottom: 1px solid var(--rule);
+    background: var(--cell);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .toolbar .left, .toolbar .right { display: flex; gap: 1.2rem; align-items: center; }
+  .toolbar button {
+    font: inherit;
+    font-family: var(--mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 0.35rem 0.9rem;
+    background: var(--paper);
+    color: var(--ink);
+    border: 1px solid var(--rule);
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  .toolbar button:hover { background: var(--ink); color: var(--paper); }
+  .toolbar button.danger:hover { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+  .toolbar .interval { color: var(--muted); }
+  .toolbar .interval b { color: var(--ink); font-weight: 700; }
+
+  /* AUTH bar */
+  .auth {
+    padding: 0.9rem 1.5rem;
+    border-bottom: 1px solid var(--rule);
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    gap: 0.8rem;
+    align-items: center;
+  }
+  .auth label {
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 700;
+  }
+  .auth input {
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 0.45rem 0.6rem;
+    background: var(--paper);
+    color: var(--ink);
+    border: 1px solid var(--rule);
+    border-radius: 0;
+    outline: none;
+    width: 100%;
+  }
+  .auth input:focus { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .auth button {
+    font-family: var(--mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    padding: 0.45rem 1rem;
+    background: var(--ink);
+    color: var(--paper);
+    border: 1px solid var(--rule);
+    cursor: pointer;
+  }
+  .auth button:hover { background: var(--accent); border-color: var(--accent); }
+  .badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    padding: 0.35rem 0.7rem;
+    border: 1px solid var(--rule);
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .badge.set { background: var(--ink); color: var(--paper); }
+  .badge.unset { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+
+  /* STATS row */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    border-bottom: 1px solid var(--rule);
+  }
+  .stat {
+    padding: 1.1rem 1.5rem;
+    border-right: 1px solid var(--rule);
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .stat:last-child { border-right: none; }
+  .stat .k {
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 700;
+  }
+  .stat .v {
+    font-family: var(--serif);
+    font-size: 2.4rem;
+    font-weight: 900;
+    line-height: 1;
+    letter-spacing: -0.03em;
+  }
+  .stat.err .v { color: var(--accent); }
+  .stat.ok .v { color: var(--ok); }
+  @media (max-width: 720px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .stat { border-bottom: 1px solid var(--rule); }
+    .stat:nth-child(2) { border-right: none; }
+    .stat:nth-last-child(-n+2) { border-bottom: none; }
+  }
+
+  /* TABLE */
+  .table-wrap { padding: 0; overflow-x: auto; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  thead th {
+    text-align: left;
+    padding: 0.7rem 0.9rem;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 700;
+    border-bottom: 2px solid var(--rule);
+    background: var(--cell);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 0.65rem 0.9rem;
+    border-bottom: 1px solid rgba(10,10,10,0.12);
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  @media (prefers-color-scheme: dark) {
+    tbody td { border-bottom-color: rgba(245,241,230,0.12); }
+  }
+  tbody tr:hover { background: var(--cell); }
+  tbody tr.err-row { background: var(--cell-hot); }
+  tbody tr.err-row:hover { background: var(--cell-hot); filter: brightness(0.96); }
+  tbody tr:last-child td { border-bottom: none; }
+
+  .id-cell {
+    font-weight: 700;
+    cursor: pointer;
+    position: relative;
+  }
+  .id-cell:hover { color: var(--accent); }
+  .id-cell .copied {
+    position: absolute;
+    left: 0; top: -1.4em;
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    opacity: 0;
+    transition: opacity 0.15s;
+    pointer-events: none;
+  }
+  .id-cell.copied-flash .copied { opacity: 1; }
+  .name-cell { color: var(--muted); }
+
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5em;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+  .status .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+    flex: 0 0 auto;
+  }
+  .status.running .dot { background: var(--ok); }
+  .status.starting .dot { background: var(--warn); animation: blink 1s steps(2, start) infinite; }
+  .status.stopped .dot { background: var(--muted); }
+  .status.error .dot { background: var(--err); }
+  .status.unknown .dot { background: var(--muted); }
+
+  .pb-cell { display: inline-flex; align-items: center; gap: 0.4em; }
+  .pb-cell .pb-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+  .pb-cell.up .pb-dot { background: var(--ok); }
+  .pb-cell.down .pb-dot { background: var(--err); }
+  .pb-cell.fetching .pb-dot { background: var(--warn); animation: blink 0.8s steps(2, start) infinite; }
+  .latency { color: var(--muted); font-size: 11px; }
+  .latency.slow { color: var(--warn); }
+  .latency.dead { color: var(--err); }
+
+  .age { color: var(--muted); font-size: 11px; }
+
+  a.open {
+    color: var(--ink);
+    text-decoration: none;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-size: 11px;
+    border-bottom: 1px solid var(--ink);
+    padding-bottom: 1px;
+  }
+  a.open:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* Empty / error states */
+  .state-box {
+    padding: 3rem 1.5rem;
+    text-align: center;
+    border-bottom: 1px solid var(--rule);
+  }
+  .state-box.serif { font-family: var(--serif); font-size: 1.5rem; font-style: italic; }
+  .state-box .small {
+    margin-top: 0.6rem;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-style: normal;
+  }
+  .state-box.err { color: var(--accent); }
+
+  /* Footer colophon */
+  .colophon {
+    margin-top: 3rem;
+    padding: 1.2rem 1.5rem;
+    border-top: 3px double var(--rule);
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+  }
+  .colophon .right { font-family: var(--serif); font-style: italic; text-transform: none; letter-spacing: 0; font-size: 12px; color: var(--ink); }
+
+  /* small */
+  ::selection { background: var(--accent); color: var(--paper); }
+</style>
+</head>
+<body>
+
+<header class="banner">
+  <h1>
+    AGENT<span class="slash">.</span>SITES
+    <span class="ctl">/ CONTROL</span>
+  </h1>
+  <div class="meta">
+    <div><span id="live-dot" class="live paused"></span><strong id="live-text">PAUSED</strong></div>
+    <div>UPDATED <strong id="updated">—</strong></div>
+    <div>BASE <strong id="base-url">—</strong></div>
+  </div>
+</header>
+
+<div class="toolbar">
+  <div class="left">
+    <span class="interval">POLL · <b id="interval-label">5s</b></span>
+    <button id="btn-poll" type="button">AUTO-REFRESH: ON</button>
+  </div>
+  <div class="right">
+    <button id="btn-refresh" type="button">↻ REFRESH</button>
+  </div>
+</div>
+
+<section class="auth" aria-label="master key">
+  <label for="mk">X-Master-Key</label>
+  <input id="mk" type="password" autocomplete="off" spellcheck="false" placeholder="paste platform master key…">
+  <button id="btn-mk-save" type="button">SAVE</button>
+  <span id="mk-badge" class="badge unset">NOT SET</span>
+</section>
+
+<section class="stats" aria-label="aggregate stats">
+  <div class="stat"><div class="k">Instances</div><div class="v" id="s-total">—</div></div>
+  <div class="stat ok"><div class="k">Alive</div><div class="v" id="s-alive">—</div></div>
+  <div class="stat"><div class="k">Dead</div><div class="v" id="s-dead">—</div></div>
+  <div class="stat err"><div class="k">Err</div><div class="v" id="s-err">—</div></div>
+</section>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Name</th>
+        <th>Status</th>
+        <th>Port</th>
+        <th>PB Health</th>
+        <th>PB Latency</th>
+        <th>Created</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="state-box" class="state-box serif" hidden></div>
+</div>
+
+<footer class="colophon">
+  <div>AGENT.SITES · OPS PANEL · v2</div>
+  <div class="right">brutalist edition</div>
+</footer>
+
+<script>
+(() => {
+  "use strict";
+
+  const MK_KEY = "agent_sites_master_key";
+  const POLL_MS = 5000;
+
+  const $ = (id) => document.getElementById(id);
+  const rowsEl = $("rows");
+  const stateBox = $("state-box");
+  const mkInput = $("mk");
+  const mkBadge = $("mk-badge");
+  const liveDot = $("live-dot");
+  const liveText = $("live-text");
+  const updatedEl = $("updated");
+  const baseUrlEl = $("base-url");
+  const btnPoll = $("btn-poll");
+  const btnRefresh = $("btn-refresh");
+  const btnMkSave = $("btn-mk-save");
+
+  let polling = true;
+  let pollTimer = null;
+  let inflight = false;
+  let lastApps = [];
+
+  baseUrlEl.textContent = location.origin;
+
+  // ---------- helpers ----------
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+
+  function getMK() {
+    try { return sessionStorage.getItem(MK_KEY) || ""; } catch { return ""; }
+  }
+  function setMK(v) {
+    try { sessionStorage.setItem(MK_KEY, v); } catch {}
+  }
+
+  function updateMkBadge() {
+    const has = !!getMK();
+    mkBadge.textContent = has ? "SET · OK" : "NOT SET";
+    mkBadge.classList.toggle("set", has);
+    mkBadge.classList.toggle("unset", !has);
+  }
+
+  function setStateBox(text, small, isErr) {
+    rowsEl.innerHTML = "";
+    stateBox.hidden = false;
+    stateBox.classList.toggle("err", !!isErr);
+    stateBox.innerHTML = escapeHtml(text) +
+      (small ? `<div class="small">${escapeHtml(small)}</div>` : "");
+  }
+  function clearStateBox() {
+    stateBox.hidden = true;
+    stateBox.innerHTML = "";
+  }
+
+  function formatAge(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    const diff = Date.now() - d.getTime();
+    if (diff < 0) return "in the future";
+    const s = Math.floor(diff / 1000);
+    if (s < 60) return s + "s ago";
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + "m ago";
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + "h " + (m % 60) + "m ago";
+    const dd = Math.floor(h / 24);
+    if (dd < 30) return dd + "d " + (h % 24) + "h ago";
+    const mo = Math.floor(dd / 30);
+    return mo + "mo ago";
+  }
+
+  function fmtMs(ms) {
+    if (ms == null) return "—";
+    if (ms < 1) return "<1ms";
+    if (ms < 1000) return Math.round(ms) + "ms";
+    return (ms / 1000).toFixed(2) + "s";
+  }
+
+  // ---------- render ----------
+  function renderRows(apps, healthMap) {
+    if (!apps || apps.length === 0) {
+      setStateBox("No apps yet.", "create one via POST /api/apps", false);
+      return;
+    }
+    clearStateBox();
+    const sorted = [...apps].sort((a, b) =>
+      (b.created_at || "").localeCompare(a.created_at || ""));
+    rowsEl.innerHTML = sorted.map((a) => {
+      const h = healthMap.get(a.id) || { state: "fetching" };
+      const isError = a.status === "error";
+      return `<tr class="${isError ? "err-row" : ""}">
+        <td class="id-cell" data-copy="${escapeHtml(a.id)}">
+          ${escapeHtml(a.id)}
+          <span class="copied">copied</span>
+        </td>
+        <td class="name-cell">${escapeHtml(a.name || "(unnamed)")}</td>
+        <td><span class="status ${escapeHtml(a.status || "unknown")}"><span class="dot"></span>${escapeHtml((a.status || "unknown").toUpperCase())}</span></td>
+        <td>${a.port != null ? ":" + escapeHtml(a.port) : "—"}</td>
+        <td>${pbHealthCell(h)}</td>
+        <td>${pbLatencyCell(h)}</td>
+        <td class="age">${escapeHtml(formatAge(a.created_at))}</td>
+        <td><a class="open" href="/${encodeURIComponent(a.id)}/" target="_blank" rel="noopener">OPEN ↗</a></td>
+      </tr>`;
+    }).join("");
+
+    // wire copy handlers
+    rowsEl.querySelectorAll(".id-cell").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const v = el.getAttribute("data-copy") || "";
+        try {
+          await navigator.clipboard.writeText(v);
+          el.classList.add("copied-flash");
+          setTimeout(() => el.classList.remove("copied-flash"), 900);
+        } catch {}
+      });
+    });
+  }
+
+  function pbHealthCell(h) {
+    const cls = "pb-cell " + (h.state || "fetching");
+    const label = h.state === "up" ? "HEALTHY"
+      : h.state === "down" ? "DOWN"
+      : h.state === "fetching" ? "…"
+      : "?";
+    return `<span class="${cls}"><span class="pb-dot"></span>${label}</span>`;
+  }
+
+  function pbLatencyCell(h) {
+    if (h.state === "up") {
+      const cls = "latency" + (h.ms >= 500 ? " slow" : "");
+      return `<span class="${cls}">${fmtMs(h.ms)}</span>`;
+    }
+    if (h.state === "down") {
+      const cls = "latency dead";
+      return `<span class="${cls}">${h.code ? "HTTP " + h.code : "NO RESPONSE"}</span>`;
+    }
+    return `<span class="latency">—</span>`;
+  }
+
+  function renderStats(apps, healthMap) {
+    const total = apps.length;
+    let alive = 0, err = 0;
+    for (const a of apps) {
+      if (a.status === "error") err++;
+      const h = healthMap.get(a.id);
+      if (a.status === "running" && h && h.state === "up") alive++;
+    }
+    const dead = total - alive;
+    $("s-total").textContent = total;
+    $("s-alive").textContent = alive;
+    $("s-dead").textContent = dead;
+    $("s-err").textContent = err;
+  }
+
+  function setLive(on) {
+    liveDot.classList.toggle("paused", !on);
+    liveText.textContent = on ? "LIVE" : "PAUSED";
+  }
+
+  function setUpdated() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    updatedEl.textContent = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+
+  // ---------- fetch ----------
+  async function fetchApps() {
+    const mk = getMK();
+    if (!mk) {
+      setStateBox("X-Master-Key required.", "paste it in the bar above, then SAVE", true);
+      lastApps = [];
+      renderStats([], new Map());
+      return null;
+    }
+    const r = await fetch("/api/apps", {
+      headers: { "X-Master-Key": mk },
+      cache: "no-store",
+    });
+    if (r.status === 401) {
+      setStateBox("Bad X-Master-Key.", "rejected by /api/apps — re-paste and SAVE", true);
+      return null;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    return Array.isArray(j.data) ? j.data : [];
+  }
+
+  async function fetchPbHealth(app) {
+    const t0 = performance.now();
+    try {
+      const r = await fetch(`/${encodeURIComponent(app.id)}/api/health`, {
+        cache: "no-store",
+      });
+      const ms = performance.now() - t0;
+      if (r.ok) return { state: "up", ms };
+      return { state: "down", ms, code: r.status };
+    } catch (e) {
+      const ms = performance.now() - t0;
+      return { state: "down", ms, code: 0 };
+    }
+  }
+
+  async function tick() {
+    if (inflight) return;
+    inflight = true;
+    try {
+      const apps = await fetchApps();
+      if (apps == null) {
+        setLive(false);
+        return;
+      }
+      lastApps = apps;
+      if (apps.length === 0) {
+        renderRows([], new Map());
+        renderStats([], new Map());
+        setUpdated();
+        setLive(polling);
+        return;
+      }
+
+      // initial render with fetching state
+      const fetching = new Map(apps.map((a) => [a.id, { state: "fetching" }]));
+      renderRows(apps, fetching);
+      renderStats(apps, fetching);
+
+      // parallel PB health probes
+      const entries = await Promise.allSettled(
+        apps.map(async (a) => [a.id, await fetchPbHealth(a)])
+      );
+      const healthMap = new Map();
+      for (const e of entries) {
+        if (e.status === "fulfilled" && e.value) healthMap.set(e.value[0], e.value[1]);
+      }
+
+      renderRows(apps, healthMap);
+      renderStats(apps, healthMap);
+      setUpdated();
+      setLive(polling);
+    } catch (e) {
+      setStateBox("Fetch failed.", String(e && e.message || e), true);
+      setLive(false);
+    } finally {
+      inflight = false;
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    if (!polling) return;
+    pollTimer = setInterval(() => {
+      // skip ticks when master key not set
+      if (!getMK()) return;
+      tick();
+    }, POLL_MS);
+  }
+  function stopPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  // ---------- events ----------
+  btnMkSave.addEventListener("click", () => {
+    setMK(mkInput.value.trim());
+    mkInput.value = "";
+    updateMkBadge();
+    tick();
+  });
+  mkInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") btnMkSave.click();
+  });
+  btnRefresh.addEventListener("click", () => tick());
+  btnPoll.addEventListener("click", () => {
+    polling = !polling;
+    btnPoll.textContent = "AUTO-REFRESH: " + (polling ? "ON" : "OFF");
+    if (polling) { startPolling(); setLive(!!getMK()); }
+    else { stopPolling(); setLive(false); }
+  });
+
+  // pause polling when tab hidden, resume when visible
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopPolling();
+    else if (polling) startPolling();
+  });
+
+  // ---------- init ----------
+  updateMkBadge();
+  setLive(false);
+  tick();
+  if (polling) startPolling();
+})();
+</script>
+</body>
+</html>

@@ -6,17 +6,17 @@ pre-commit:
   parallel: true
   commands:
     fmt:
-      glob: "*.rs"
-      run: cargo fmt --all -- --check
-      fix: cargo fmt --all
+      glob: "*.{ts,js,mjs,cjs,json,md}"
+      run: deno fmt --check src/
+      fix: deno fmt src/
+
+    lint:
+      glob: "*.ts"
+      run: deno lint src/
 
     check:
-      glob: "*.rs"
-      run: cargo check --all-targets
-
-    clippy:
-      glob: "*.rs"
-      run: cargo clippy --all-targets -- -W clippy::all
+      glob: "*.ts"
+      run: deno check 'src/**/*.ts'
 
     typos:
       run: typos --ignore-hidden 2>/dev/null || true

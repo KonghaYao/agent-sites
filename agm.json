@@ -1,0 +1,18 @@
+{
+  "name": "agent-sites",
+  "version": "1.0.0",
+  "description": "",
+  "author": "",
+  "registry": null,
+  "targets": [
+    "claude"
+  ],
+  "skills": {
+    "@git/KonghaYao/peri": "a28b236954e12023bce0f14154994a381d8a16f8"
+  },
+  "agents": {
+    "@git/KonghaYao/peri": "a28b236954e12023bce0f14154994a381d8a16f8"
+  },
+  "mcp": {},
+  "overrides": {}
+}

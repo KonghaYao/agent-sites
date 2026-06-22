@@ -1,0 +1,26 @@
+{
+  "lockfileVersion": 1,
+  "importers": {
+    ".": {
+      "skills": {
+        "@git/KonghaYao/peri": {
+          "version": "a28b236954e12023bce0f14154994a381d8a16f8"
+        }
+      },
+      "agents": {},
+      "mcp": {}
+    }
+  },
+  "packages": {
+    "@git/KonghaYao/peri@a28b236954e12023bce0f14154994a381d8a16f8": {
+      "resolution": {
+        "type": "git",
+        "repo": "https://github.com/KonghaYao/peri",
+        "commit": "a28b236954e12023bce0f14154994a381d8a16f8"
+      },
+      "targets": [
+        "claude"
+      ]
+    }
+  }
+}

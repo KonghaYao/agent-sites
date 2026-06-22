@@ -1,5 +1,5 @@
-# Rust
-target/
+# Deno（vendored 缓存 / 临时产物；deno.lock 必须 tracked）
+.deno/
 
 # Database
 *.db
@@ -30,4 +30,18 @@ dist/
 build/
 
 # Claude
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/agent-sites-deploy/
+
+# Runtime data
+data/sites
+
+# PocketBase 二进制（由 scripts/fetch-pocketbase.sh 下载）
+bin/pocketbase
+data/
+# public/ 下 App 前端文件是运行时数据（每环境 app_id 不同），但
+# _panel/ 是平台内置控制面板资源，必须 tracked。
+public/*
+!public/_panel/

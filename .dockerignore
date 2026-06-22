@@ -1,0 +1,29 @@
+# VCS
+.git/
+.gitignore
+
+# 运行时数据（容器内自创，避免宿主机污染镜像）
+data/
+
+# PocketBase 二进制：宿主机可能是 macOS arm64，不能进 Linux 镜像
+# （Dockerfile 内置 pb-fetcher 阶段会拉 Linux 版）
+bin/
+
+# 凭证（master key 明文）
+.env
+.env.*
+
+# 文档 + Claude 工具配置（不影响运行）
+docs/
+.claude/
+
+# 测试 + 临时产物
+**/*_test.ts
+**/*.test.ts
+
+# 工具元数据
+agm.json
+agm.lock.json
+Dockerfile
+docker-compose.yml
+.dockerignore

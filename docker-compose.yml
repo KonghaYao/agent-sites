@@ -1,0 +1,34 @@
+# docker-compose.yml
+#
+# 用法：
+#   1. cp .env.example .env && 填入 AGENT_SITES_MASTER_KEY（openssl rand -hex 32）
+#   2. docker compose up -d --build
+#   3. 浏览器打开 http://localhost:3000/，在 AUTH bar 粘贴 master key
+#
+# 数据持久化：
+#   ./data   → App 元数据 + tokens + 每个 App 的 PocketBase SQLite
+#   ./public → 用户上传的前端文件（_panel 控制面板由镜像内置，bind mount 后可见）
+
+services:
+  agent-sites:
+    build:
+      context: .
+      # 多架构 build 时 docker buildx 会按 TARGETARCH 拉对应 Linux 版 PocketBase
+      # 单平台 docker build 默认 amd64（见 Dockerfile ARG TARGETARCH=amd64）
+    image: agent-sites:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./public:/app/public
+    # 敏感凭证走 .env（参考 .env.example），不入 git
+    env_file:
+      - .env
+    environment:
+      # 通用默认值；如需调整在此覆盖
+      - HOST=0.0.0.0
+      - PORT=3000
+      - PB_PORT_MIN=9000
+      - PB_PORT_MAX=11000
+      - MAX_APPS=50
+    restart: unless-stopped
