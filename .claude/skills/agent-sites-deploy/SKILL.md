@@ -1,105 +1,138 @@
 ---
 name: agent-sites-deploy
-description: Agent 站点托管平台部署与运维。当 Agent 需要在 Agent Sites 平台上创建 App、申请 platform token、上传前端文件、通过 PocketBase 代理操作 collections 时使用。
+description: Agent Sites 平台建站部署。当需要在平台上创建 App、申请 token、配 PocketBase 后端 collection、上传前端文件并发布站点时使用。说"部署到平台"、"创建 app"、"建站"、"发布前端"、"配后端"时触发。
 ---
 
 # agent-sites-deploy
 
-Agent Sites 平台交互 Skill。每个 App = 一个 PocketBase 子进程 + 独立数据目录 + 前端静态文件目录。通过 HTTP API 与平台交互。
+在 Agent Sites 平台上建站。每个 App = 一个独立 PocketBase 后端 + 前端静态目录，通过 HTTP API 操作。
 
-## 前置条件
-
-- 平台 URL（环境变量 `AGENT_SITES_URL`，默认 `http://localhost:3000`）
-- Master key（环境变量 `AGENT_SITES_MASTER_KEY`，由平台运维生成；`openssl rand -hex 32`）
-- 本机需安装 `curl`、`jq`
-
-## 三层鉴权
-
-| 场景 | 凭证 | Endpoint |
-|------|------|---------|
-| 平台管理（创建/删除 App、申请/吊销 token） | `X-Master-Key: $AGENT_SITES_MASTER_KEY` | `/api/apps*`、`/api/tokens*`、`/api/apps/{id}/files*` |
-| App 操作（CRUD collections / records） | `Authorization: Bearer <platform_token>` | `/{app_id}/api/*` |
-| 业务前端（公开页面 / 用户登录态） | 无 或 PB user token | `/{app_id}/api/*`（透传给 PocketBase Rules） |
-
-## API 响应格式
-
-**平台路由响应**（`/api/apps*`、`/api/tokens*`、`/api/apps/{id}/files*`）统一壳：
-
-```json
-// 成功
-{"data": {...}, "error": null, "request_id": "abc12345"}
-
-// 失败
-{"data": null, "error": {"code": "ERROR_CODE", "message": "..."}, "request_id": "..."}
-```
-
-错误码：`NOT_FOUND` (404)、`FORBIDDEN` (403)、`UNAUTHORIZED` (401)、`CONFLICT` (409)、`BAD_REQUEST` (400)、`PAYLOAD_TOO_LARGE` (413)、`PB_UNAVAILABLE` (503)、`INTERNAL_ERROR` (500)。
-
-> 注意：503 的 code 是 `PB_UNAVAILABLE`（不是 `SERVICE_UNAVAILABLE`），500 的 code 是 `INTERNAL_ERROR`（不是 `INTERNAL`）。直接 grep `error.ts` 的工厂方法可见全部 8 个 code 字面量。
-
-**PocketBase 透传响应**（`/{app_id}/api/*`）保留 PB 原生 envelope `{data, message, status}`，**不进**平台壳。详见 `references/proxy.md`。
-
-## 任务导向导航
-
-按当前要做的事查阅对应 reference：
-
-| 任务场景 | Reference |
-|---------|-----------|
-| 创建 / 列出 / 查询 / 删除 App（含 name 规则、占位 index.html、删除联动行为） | [`references/apps.md`](references/apps.md) |
-| 申请 / 列出 / 吊销 platform token（永久有效、仅展示一次、`last_used_at` 永久 null） | [`references/tokens.md`](references/tokens.md) |
-| 上传前端文件：单文件 PUT（≤ 1 MiB）/ 整目录 gzip tar bundle（≤ 10 MiB 压缩 / ≤ 50 MiB 解压 / ≤ 5 MiB 单文件 / ≤ 200 条目） | [`references/files.md`](references/files.md) |
-| PocketBase 代理：`/{app_id}/api/*` 凭证代换、PB 原生 envelope、Admin UI 屏蔽、自愈机制 | [`references/proxy.md`](references/proxy.md) |
-| 浏览器访问入口：`GET /{app_id}/{*path}` 静态文件 + 自动注入 fetch shim | [`references/access.md`](references/access.md) |
-| Fetch shim 自动兜底：`fetch('/api/x')` 重写为 `/{app_id}/api/x`，注入位置、重写规则、限制 | [`references/shim.md`](references/shim.md) |
-| ⚠️ 前端相对路径陷阱：`<a>` / `<img>` / `<link>` / `axios` / `XMLHttpRequest` 不被 shim 覆盖，需要手动处理 | [`references/frontend-paths.md`](references/frontend-paths.md) |
-| 排障：401/403/404/413/503 错误消息对照、PB envelope 误解 | [`references/troubleshooting.md`](references/troubleshooting.md) |
-
-## Quick Start（copy-paste 可跑）
-
-前置：`AGENT_SITES_URL` 和 `AGENT_SITES_MASTER_KEY` 已 export，平台已 `deno task start`，`curl`/`jq` 已装。
+## 前置
 
 ```bash
-# 1. 创建 App（自动 spawn PocketBase + 预置 superuser + 写占位 index.html）
+export AGENT_SITES_URL=http://localhost:3000        # 平台地址
+export AGENT_SITES_MASTER_KEY=<openssl rand -hex 32> # 平台 master key
+# 需要 curl + jq
+```
+
+## Quick Start
+
+按顺序五步。第 1、2 步产生的 `$APP_ID`、`$TOKEN` 供后续步骤复用。前三步调 API，文件读写一律用 Write/Read 工具，不要用 shell 的 `echo`/`cat`/`sed` 操作文件。
+
+### 1. 创建 App
+
+自动拉起独立 PocketBase 后端 + 写占位 index.html。
+
+```bash
 APP_ID=$(curl -s -X POST $AGENT_SITES_URL/api/apps \
   -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" \
-  -H "Content-Type: application/json" -d '{"name":"todo"}' \
+  -H "Content-Type: application/json" -d '{"name":"my-app"}' \
   | jq -r '.data.id')
 echo "APP_ID=$APP_ID"   # 形如 app-abcd1234
+```
 
-# 2. 申请 platform token（仅此一次返回 token 字符串，丢了要重新申请）
+### 2. 申请 platform token
+
+仅展示一次，立即存起来；丢了只能重新申请、吊销旧的。
+
+```bash
 TOKEN=$(curl -s -X POST $AGENT_SITES_URL/api/tokens \
   -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"app_id\":\"$APP_ID\"}" \
-  | jq -r '.data.token')
+  -d "{\"app_id\":\"$APP_ID\"}" | jq -r '.data.token')
+```
 
-# 3. 用 token 创建 PB collection
+### 3. 配后端 collection
+
+用 token 凭证代换为 superuser。字段必须带 `"id"`；rules 设 `""` 允许匿名访问（公开读写）。
+
+```bash
 curl -s -X POST $AGENT_SITES_URL/$APP_ID/api/collections \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name":"todos","type":"base","schema":[{"name":"title","type":"text"}]}' \
-  | jq '.status, .name'   # → 200, "todos"（PB 原生 envelope，非平台壳）
-
-# 4. 上传前端 HTML（≤ 1 MiB；用 --data-binary，不能用 -F multipart）
-echo '<!doctype html><title>todo</title><h1>It works</h1>' > /tmp/index.html
-curl -s -X PUT $AGENT_SITES_URL/api/apps/$APP_ID/files/index.html \
-  -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" \
-  --data-binary @/tmp/index.html | jq '.data.path, .data.bytes'
-
-# 5. 浏览器 GET /{app_id}/ 验证（响应里应含 "It works" + 注入的 fetch shim）
-curl -s $AGENT_SITES_URL/$APP_ID/ | grep -o 'It works\|window.fetch'
-# → It works
-# → window.fetch
+  -d '{
+    "name":"messages","type":"base",
+    "fields":[
+      {"id":"text1001","name":"author","type":"text","required":true,"min":1,"max":50,"system":false,"hidden":false,"presentable":false,"pattern":"","autogeneratePattern":""},
+      {"id":"text1002","name":"body","type":"text","required":true,"min":1,"max":500,"system":false,"hidden":false,"presentable":false,"pattern":"","autogeneratePattern":""}
+    ],
+    "listRule":"","viewRule":"","createRule":"","updateRule":null,"deleteRule":null
+  }' | jq '.name'   # → "messages"
 ```
 
-5 步全绿 = 平台就绪，可以放手干真正的活。任一步报错查 [`references/troubleshooting.md`](references/troubleshooting.md)。
+### 4. 写前端并上传
 
+前端文件用 Write 工具创建（**不要用 shell 的 `echo`/`cat` 写文件**）。最小示例 `index.html`：
 
-## 关键不变量（必读）
+```html
+<!doctype html>
+<html><body><h1>It works</h1></body></html>
+```
 
-- **App 响应不含凭证**：`POST /api/apps` 返回的 `AppResponse` 没有 `superuser_email` / `superuser_password`。所有 App 内部操作走 platform token 凭证代换。
-- **Platform token 永久有效**，无 expiry、无 refresh。吊销靠 `DELETE /api/tokens/{id}` 把 status 标记为 `revoked`（立即生效）。`last_used_at` 永久 null，仅 schema 占位。
-- **DELETE App 是真删**：停进程 + 删数据目录 + 删静态目录 + 吊销该 App 所有 token。无宽限期，不可恢复。
-- **Admin UI 不开放**：`/{app_id}/_/` 返 404，agent 只能通过 platform token + API 操作 collections。
-- **HTML 响应自动注入 fetch shim**：HTML GET 响应在第一个 `<head>` 后注入 JS，monkey-patch `window.fetch`，把绝对路径 `/api/x` 重写为 `/{app_id}/api/x`。非 fetch 场景（`<a>` / `<img>` / `axios`）仍需手动改相对路径。
-- **PB 透传响应保留原生 envelope**：`{data, message, status}`，status code 也透传（PB 0.20+ 创建返 200 不是 201）。错误处理要同时支持平台壳和 PB 原生壳。
+上传（用 `--data-binary`，不能用 `-F`；单文件 ≤ 1 MiB）：
+
+```bash
+curl -s -X PUT $AGENT_SITES_URL/api/apps/$APP_ID/files/index.html \
+  -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" \
+  --data-binary @index.html | jq '.data.path'
+```
+
+### 5. 访问验证
+
+站点已上线，浏览器打开：
+
+```
+$AGENT_SITES_URL/$APP_ID/
+```
+
+---
+
+整站批量上传用 gzip tar（压缩前 ≤ 10 MiB / 解压 ≤ 50 MiB / 单文件 ≤ 5 MiB / ≤ 200 条目）：
+
+```bash
+tar czf site.tar.gz -C ./dist .
+curl -s -X POST $AGENT_SITES_URL/api/apps/$APP_ID/files/bundle \
+  -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" \
+  --data-binary @site.tar.gz | jq '.data.total_files'
+```
+
+### 更新已上线的前端
+
+PUT 同路径直接覆盖（幂等）——改完重新 PUT 即更新，无需额外操作。编辑一律用 Read/Edit/Write 工具，不要用 shell 的 `echo`/`cat`/`sed`。
+
+- 本地有副本：Read 读取 → Edit 修改 → 重新 PUT 上传。
+- 本地没有副本：先 GET 线上当前内容作参考 → 用 Write 落盘本地 → Edit 改 → PUT 上传。
+
+查看当前线上内容（只读参考，不要用 shell 重定向存盘）：
+
+```bash
+curl -s $AGENT_SITES_URL/$APP_ID/index.html
+```
+
+改好后重新上传（同路径覆盖）：
+
+```bash
+curl -s -X PUT $AGENT_SITES_URL/api/apps/$APP_ID/files/index.html \
+  -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" \
+  --data-binary @index.html | jq '.data.path'
+```
+
+> 无单文件删除 API。要撤下某个文件只能用同路径 PUT 覆盖成空/占位；撤下整站则 DELETE 整个 App。
+
+## 凭证：用哪个
+
+| 要做什么                          | 用什么                                           |
+| --------------------------------- | ------------------------------------------------ |
+| 管理 App / token / 上传文件       | `X-Master-Key: $AGENT_SITES_MASTER_KEY`          |
+| 创建/修改后端 collection、records | `Authorization: Bearer $TOKEN`（platform token） |
+| 业务前端公开访问后端              | 不带凭证，交给 collection 的 rules               |
+
+## 实操要点
+
+- **Platform token 只展示一次**。响应里 `.data.token` 要立即存起来；丢了只能重新申请、吊销旧的。
+- **前端 fetch 自动重写**：浏览器 GET HTML 时平台会注入 shim，把 `fetch('/api/x')` 自动重写成 `fetch('/{app_id}/api/x')`。所以前端里绝对路径 `/api/...` 直接用。
+- **fetch 以外的路径要手动改相对路径**：`<a href>`、`<img src>`、`<link href>`、`axios`、`XMLHttpRequest` 不被 shim 覆盖，写成相对路径（`./api/x` 或 `api/x`）。
+- **后端公开访问靠 rules**：collection 创建时 `listRule`/`viewRule`/`createRule` 设为 `""` 表示允许匿名；设 `null` 表示禁用；设表达式表示条件。业务前端匿名访问就靠这个。
+- **上传用 `--data-binary`**，不是 `-F`（multipart）。后缀白名单：html/htm/css/js/json/svg/png/jpg/jpeg/webp/ico/txt/map。
+- **DELETE App 是真删**：停后端 + 删数据 + 删前端，不可恢复，且吊销该 App 所有 token。
+- **响应取值**：平台路由（`/api/apps*`、`/api/tokens*`、文件上传）用 `jq '.data.xxx'`；后端代理（`/{app_id}/api/*`）是 PocketBase 原生格式，列表用 `jq '.items'`、总数 `.totalItems`。出错看 `.error.message` 或 `.message`。
