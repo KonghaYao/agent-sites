@@ -1,0 +1,97 @@
+# Tag 版本部署 → 推送镜像到 GitHub Container Registry (ghcr.io)
+#
+# 触发：push 任意 v* 开头的 tag（如 v1.0.0、v1.0.0-rc1、v2026.06.22）
+# 产物：ghcr.io/${{ github.repository }}:<tag>（原 tag 名，含 v 前缀）
+#       ghcr.io/${{ github.repository }}:<semver>（去 v 前缀，仅纯数字 SemVer 时打）
+#       ghcr.io/${{ github.repository }}:latest（仅在非预发布 tag 时打）
+# 架构：amd64（单架构，CI 最快）
+#
+# 前置条件：
+#   1. 仓库 Settings → Actions → General → Workflow permissions 设为
+#      "Read and write permissions"，或保持默认（本 workflow 已显式声明 permissions: packages: write）
+#   2. 首次 push 后，访问 https://github.com/users/<owner>/packages/container/<repo>/settings
+#      把镜像 visibility 设为 public（默认 private，拉取需 docker login）
+
+name: Release (tag → ghcr)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 防止同 tag 重复构建时并发冲突
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# 显式声明最小权限：GHCR 推送需要 packages: write；读仓代码需要 contents: read
+# （即使 repo 设置默认只读，本声明也会覆写为 write）
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # 自动注入，无需手动配置 secret
+
+      - name: Parse tag → image tags
+        id: meta
+        run: |
+          set -eu
+          RAW_TAG="${GITHUB_REF_NAME}" # 如 v1.2.3 / v1.2.3-rc1 / v2026.06.22
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY}" # 自动 lowercase 见下一步
+          echo "raw_tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          # 用 , 分隔的多 tag 字符串供 docker/metadata-action 消费
+          echo "tags=$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      # GHCR 要求镜像名全小写；GitHub 仓库 owner 可能含大写（如 OrgName/Repo）
+      - name: Lowercase image name
+        id: lcase
+        run: |
+          echo "image=$(echo '${{ steps.meta.outputs.image }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # docker/metadata-action 自动按规则生成 tag 列表：
+      #   type=raw          → 直接用 git tag 名（v 前缀保留）
+      #   type=semver        → 去掉 v 前缀的纯 SemVer（{major}.{minor}.{patch}），
+      #                         仅当 tag 形如 v1.2.3 时生效，v1.2.3-rc1 不打
+      #   type=raw=value=latest + enable 仅在非 prerelease 时打 latest
+      - name: Generate image tags
+        id: tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.lcase.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.meta.outputs.raw_tag }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !contains(steps.meta.outputs.raw_tag, '-') }}
+            type=raw,value=latest,enable=${{ !contains(steps.meta.outputs.raw_tag, '-') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.tags.outputs.labels }}
+          # GitHub Actions 缓存：免费额度内，加速重复 build
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 不显式传 build-args：PB_VERSION / DENO_VERSION 用 Dockerfile ARG 默认值，
+          # 避免两处版本号需要手动同步。升级时只改 Dockerfile 即可。
