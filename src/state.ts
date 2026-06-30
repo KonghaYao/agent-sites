@@ -18,6 +18,7 @@ import type { AppStore } from "./app/store.ts";
 import { TokenStore } from "./auth/token_store.ts";
 import { PbTokenCache } from "./auth/pb_token_cache.ts";
 import type { PocketBaseProcessManager } from "./process/mod.ts";
+import { CustomProcessManager } from "./app/custom_pm.ts";
 
 /**
  * 全局共享状态（对应 Rust `pub struct AppState`）。
@@ -55,6 +56,8 @@ export class AppState {
   public tokenStore: TokenStore;
   /** PB token 缓存（凭证代换层）。 */
   public pbTokenCache: PbTokenCache;
+  /** 自定义应用进程管理器。 */
+  public customProcessManager: CustomProcessManager;
 
   /**
    * 创建全局共享状态。
@@ -62,6 +65,7 @@ export class AppState {
    * 参数顺序与 Rust `AppState::new` 一一对应（除了 TS 命名改为 camelCase）。
    * Rust 端 `#[allow(clippy::too_many_arguments)]` 容忍多参数构造器；
    * TS 端保留同样的参数列表以维持 1:1 公共 API（调用方 main.ts 集中构造）。
+   * customProcessManager 为可选参数，缺省时自动创建新实例（不影响已有调用方）。
    */
   constructor(
     pbBinary: string,
@@ -75,6 +79,7 @@ export class AppState {
     masterKey: string,
     tokenStore: TokenStore,
     pbTokenCache: PbTokenCache,
+    customPm?: CustomProcessManager,
   ) {
     this.pbBinary = pbBinary;
     this.dataDir = dataDir;
@@ -87,6 +92,7 @@ export class AppState {
     this.masterKey = masterKey;
     this.tokenStore = tokenStore;
     this.pbTokenCache = pbTokenCache;
+    this.customProcessManager = customPm ?? new CustomProcessManager();
   }
 
   /**
