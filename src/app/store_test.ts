@@ -22,6 +22,7 @@ function make_app(id: string, port: number, status: AppStatus): App {
   return {
     id,
     name: `name-${id}`,
+    type: "pocketbase",
     port,
     status,
     created_at: "2026-06-19T10:00:00Z",

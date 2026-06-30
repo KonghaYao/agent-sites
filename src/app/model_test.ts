@@ -15,6 +15,7 @@ function make_app(overrides: Partial<App> = {}): App {
   return {
     id: "app-abc123",
     name: "my-app",
+    type: "pocketbase",
     port: 9001,
     status: "running",
     created_at: "2026-06-19T10:00:00Z",

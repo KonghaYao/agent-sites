@@ -202,6 +202,7 @@ export async function createApp(
     return {
       id,
       name: name.length === 0 ? id : name,
+      type: "pocketbase",
       port: 0,
       status: "starting",
       created_at: now,
