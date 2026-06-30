@@ -1,11 +1,16 @@
 ---
 name: agent-sites-deploy
-description: Agent Sites 平台建站部署。当需要在平台上创建 App、申请 token、配 PocketBase 后端 collection、上传前端文件并发布站点时使用。说"部署到平台"、"创建 app"、"建站"、"发布前端"、"配后端"时触发。
+description: Agent Sites 平台建站部署。当需要在平台上创建 App、申请 token、配 PocketBase 后端 collection、上传前端文件并发布站点时使用。也支持自定义 Deno 全栈应用部署。说"部署到平台"、"创建 app"、"建站"、"发布前端"、"配后端"时触发。
 ---
 
 # agent-sites-deploy
 
-在 Agent Sites 平台上建站。每个 App = 一个独立 PocketBase 后端 + 前端静态目录，通过 HTTP API 操作。
+在 Agent Sites 平台上建站。支持两种模式：
+
+- **经典模式**（本文档）：一个独立 PocketBase 后端 + 前端静态目录。适合静态前端 + 简单 CRUD 后端。
+- **自定义应用模式**：上传自包含 Deno 应用（`main.ts`/`main.js`），平台 spawn 子进程 + 全量代理。适合任意全栈应用。详见 [`custom-app-mode.md`](custom-app-mode.md)。
+
+> 下面的 Quick Start 和所有细节针对**经典模式**。自定义应用模式的部署方式不同——创建时加 `"type":"custom"`，通过 `POST /api/apps/{id}/deploy` 上传 gzip 包。
 
 ## 前置
 
