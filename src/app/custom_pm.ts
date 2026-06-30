@@ -15,6 +15,19 @@ export interface CustomAppStartParams {
 }
 
 /**
+ * 自定义应用进程白名单环境变量。
+ * 只透传四个基本环境变量，防止平台凭证（如 AGENT_SITES_MASTER_KEY）泄漏到子进程。
+ */
+function customEnvWhitelist(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of ["PATH", "HOME", "LANG", "TZ"]) {
+    const v = Deno.env.get(key);
+    if (v !== undefined) out[key] = v;
+  }
+  return out;
+}
+
+/**
  * 自定义应用进程管理器。
  *
  * 一个 App 一个 ManagedProcess。双槽位切换期间临时持有两个进程
@@ -55,8 +68,8 @@ export class CustomProcessManager {
       stdin: "null",
       stdout: "null",
       stderr: "null",
-      clearEnv: false,
-      env: { PORT: String(port) },
+      clearEnv: true,
+      env: { ...customEnvWhitelist(), PORT: String(port) },
     });
 
     let child: Deno.ChildProcess;
@@ -96,9 +109,19 @@ export class CustomProcessManager {
     if (!proc) return;
     this.processes.delete(appId);
     proc.startKill();
-    await raceWithTimeout(proc.statusPromise, 5_000).catch(() => {
+    try {
+      await raceWithTimeout(proc.statusPromise, 5_000);
+    } catch {
       proc.child.kill("SIGKILL");
-    });
+      // await the status to reap zombie
+      try {
+        await proc.statusPromise;
+      } catch { /* ignore */ }
+    }
+    // drain exitHandler to prevent floating promise chain
+    try {
+      await proc.exitHandler;
+    } catch { /* ignore */ }
   }
 
   /** 进程是否存活。 */
