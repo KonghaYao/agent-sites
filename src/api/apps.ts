@@ -63,12 +63,14 @@ export type Handler = (req: Request, ctx: Ctx) => Promise<Response>;
 /** 创建 App 请求体（对应 Rust CreateAppRequest）。 */
 export interface CreateAppRequest {
   name?: string;
+  type?: "pocketbase" | "custom";
 }
 
 /** App 响应体（不含任何敏感字段——凭证仅存内部 store，不外露）。 */
 export interface AppResponse {
   id: string;
   name: string;
+  type: string;
   port: number;
   status: string;
   api_path: string;
@@ -78,7 +80,10 @@ export interface AppResponse {
 /**
  * 把内部 App 实体转成对外 AppResponse（对应 Rust `impl From<&App> for AppResponse`）。
  *
- * api_path 固定为 `/{id}/api`，status 取字符串形式（Rust as_str → TS 字面量本身就是 string）。
+ * api_path 按 type 区分：
+ * - pocketbase → `/{id}/api`（PB API 入口）
+ * - custom → `/{id}`（自定义应用根路径）
+ * status 取字符串形式（Rust as_str → TS 字面量本身就是 string）。
  * 注意：superuser_email/password 不外露——凭证代换走 platform token，
  * 由 /api/tokens 签发，凭证本身只在内部 store 中。
  */
@@ -86,9 +91,10 @@ export function toAppResponse(a: App): AppResponse {
   return {
     id: a.id,
     name: a.name,
+    type: a.type,
     port: a.port,
     status: a.status,
-    api_path: `/${a.id}/api`,
+    api_path: a.type === "custom" ? `/${a.id}` : `/${a.id}/api`,
     created_at: a.created_at,
   };
 }
@@ -194,6 +200,7 @@ export async function createApp(
     }
   }
   const name = requestBody.name !== undefined ? normalizeName(requestBody.name) : "";
+  const appType: "pocketbase" | "custom" = requestBody.type === "custom" ? "custom" : "pocketbase";
 
   // 分配 id（Issue #5：用 addIfAbsent 原子 check+insert，避免 TOCTOU）
   const allocator = new PortAllocator(state.portMin, state.portMax);
@@ -202,6 +209,7 @@ export async function createApp(
     return {
       id,
       name: name.length === 0 ? id : name,
+      type: appType,
       port: 0,
       status: "starting",
       created_at: now,
@@ -222,6 +230,21 @@ export async function createApp(
     await state.store.flush();
   } catch (e) {
     throw AppError.Internal(`持久化失败: ${e}`);
+  }
+
+  // custom 类型：只创建目录 + 标记 running，不需要 PocketBase
+  if (appType === "custom") {
+    const dataDir = `${state.dataDir}/${id}`;
+    await Deno.mkdir(dataDir, { recursive: true });
+    await Deno.mkdir(`${dataDir}/runtime`, { recursive: true });
+
+    app.status = "running";
+    app.updated_at = new Date().toISOString();
+    await state.store.update(app);
+    await state.store.flush();
+
+    const resp = toAppResponse(app);
+    return Response.json({ data: resp, error: null });
   }
 
   // 数据目录 + superuser 凭证
@@ -359,6 +382,8 @@ export async function deleteApp(
   }
   // 停进程
   await state.processManager.stop(id);
+  // 停 custom 进程（若存在）
+  await state.customProcessManager.stop(id);
   // 删记录
   await state.store.remove(id);
   try {

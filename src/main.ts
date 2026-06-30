@@ -165,11 +165,17 @@ OPTIONS:
  * 三重保险的第 (b) 层（DESIGN CONTEXT 决策）。
  */
 async function globalCleanup(state: AppState): Promise<void> {
-  const appIds = Array.from(state.processManager.processes.keys());
-  if (appIds.length === 0) return;
-  console.info(`全局 cleanup：停止 ${appIds.length} 个 PocketBase 进程`);
-  // 并发 stop 所有进程，每个 stop 内部已有 SIGTERM→SIGKILL 兜底
-  await Promise.all(appIds.map((id) => state.processManager.stop(id)));
+  const pbAppIds = Array.from(state.processManager.processes.keys());
+  const customAppIds = Array.from(state.customProcessManager.processes.keys());
+  if (pbAppIds.length === 0 && customAppIds.length === 0) return;
+  const parts: string[] = [];
+  if (pbAppIds.length > 0) parts.push(`${pbAppIds.length} 个 PB 进程`);
+  if (customAppIds.length > 0) parts.push(`${customAppIds.length} 个自定义进程`);
+  console.info(`全局 cleanup：停止 ${parts.join(" + ")}`);
+  const stops: Promise<void>[] = [];
+  for (const id of pbAppIds) stops.push(state.processManager.stop(id));
+  for (const id of customAppIds) stops.push(state.customProcessManager.stop(id));
+  await Promise.all(stops);
 }
 
 /**

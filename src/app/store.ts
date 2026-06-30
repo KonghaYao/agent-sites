@@ -51,6 +51,10 @@ export class AppStore {
       );
       apps = [];
     }
+    // 向前兼容：没有 type 字段的旧记录默认为 pocketbase
+    for (const a of apps) {
+      if (!a.type) (a as unknown as Record<string, unknown>).type = "pocketbase";
+    }
     // 端口范围校验（SSRF 防护）：越界端口跳过
     this.apps = apps.filter((a) => {
       if (a.port < portMin || a.port > portMax) {

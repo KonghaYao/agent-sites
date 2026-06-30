@@ -47,6 +47,7 @@ import {
 } from "./api/tokens.ts";
 import { uploadFile as uploadFileHandler } from "./api/files.ts";
 import { uploadBundle as uploadBundleHandler } from "./api/files_bundle.ts";
+import { deployApp as deployHandler } from "./api/deploy.ts";
 import { verifyMasterKeyHeader, verifyPlatformToken } from "./auth/master_key.ts";
 
 // ---------------------------------------------------------------------------
@@ -223,6 +224,12 @@ function buildRoutes(): Route[] {
       segments: parsePattern("/api/apps/{id}/files/bundle"),
       handler: uploadBundleHandler,
     },
+    // 自定义应用部署（gzip tar 归档 + 启动 deno 子进程；master key 强制）
+    {
+      method: "post",
+      segments: parsePattern("/api/apps/{id}/deploy"),
+      handler: deployHandler,
+    },
     // Token CRUD（master key 强制）
     {
       method: "post",
@@ -378,6 +385,11 @@ async function serveApiProxy(
     throw AppError.NotFound(`App 不存在: ${appId}`);
   }
 
+  // 分流：custom 类型全量代理到自定义应用端口
+  if (app.type === "custom") {
+    return await serveCustomProxy(state, appId, app, req, ctx);
+  }
+
   // status=Error 直接短路
   if (app.status === "error") {
     throw AppError.ServiceUnavailable(
@@ -413,15 +425,15 @@ async function serveApiProxy(
 
   // 第二关：forward + PB 401 兜底重试
   try {
-    const resp = await forward(
-      app.port,
-      upstreamPath,
+    const resp = await forward({
+      port: app.port,
+      path: upstreamPath,
       method,
       headers,
       body,
-      DEFAULT_MAX_BODY_BYTES,
-      appId,
-    );
+      maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+      cookieScope: appId,
+    });
     // PB 返 401 + 本次 Authorization 是凭证代换来的 → 缓存的 PB token 可能
     // 已过期/被 PB 端撤销，清缓存重试一次
     if (
@@ -429,15 +441,15 @@ async function serveApiProxy(
       headers.get("X-Replaced-From-Platform-Token") === "1"
     ) {
       state.pbTokenCache.invalidate(`http://localhost:${app.port}`);
-      return await forward(
-        app.port,
-        upstreamPath,
+      return await forward({
+        port: app.port,
+        path: upstreamPath,
         method,
         headers,
         body,
-        DEFAULT_MAX_BODY_BYTES,
-        appId,
-      );
+        maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+        cookieScope: appId,
+      });
     }
     return resp;
   } catch (e) {
@@ -543,15 +555,15 @@ async function handleProxyWithRecovery(
         `restart 后 PM 中找不到 ${appId} 的端口（内部状态不一致）`,
       );
     }
-    return await forward(
+    return await forward({
       port,
-      upstreamPath,
+      path: upstreamPath,
       method,
       headers,
       body,
-      DEFAULT_MAX_BODY_BYTES,
-      appId,
-    );
+      maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+      cookieScope: appId,
+    });
   }
 
   // RateLimited | GiveUp：同步 status=Error + flush
@@ -575,14 +587,111 @@ async function handleProxyWithRecovery(
 }
 
 /**
+ * 自定义应用代理：全量转发请求到 deno 子进程端口。
+ * 惰性重启：进程不在时自动启动。
+ */
+async function serveCustomProxy(
+  state: AppState,
+  appId: string,
+  app: App,
+  req: Request,
+  _ctx: Ctx,
+): Promise<Response> {
+  // 惰性重启：进程不在则启动
+  if (!state.customProcessManager.isAlive(appId)) {
+    const slot = app.active_slot || "a";
+    const entryFile = app.entry_file || "main.ts";
+    const codeDir = `${state.dataDir}/${appId}/deploy-${slot}`;
+    const runtimeDir = `${state.dataDir}/${appId}/runtime`;
+
+    try {
+      await state.customProcessManager.startAndWait({
+        appId,
+        port: app.port,
+        codeDir,
+        runtimeDir,
+        entryFile,
+      }, 10);
+    } catch (e) {
+      console.error(
+        `自定义应用惰性启动失败 app_id=${appId} error=${(e as Error).message}`,
+      );
+      throw AppError.ServiceUnavailable(`App ${appId} 启动失败`);
+    }
+  }
+
+  const port = state.customProcessManager.getPort(appId);
+  if (port === undefined) {
+    throw AppError.ServiceUnavailable(`App ${appId} 进程端口未知`);
+  }
+
+  const body = await readBodyBytes(req);
+  const url = new URL(req.url);
+  const upstreamPath = url.pathname + url.search;
+
+  try {
+    return await forward({
+      port,
+      path: upstreamPath,
+      method: req.method,
+      headers: new Headers(req.headers),
+      body,
+      maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+      proxyHeaders: {
+        forwardedHost: req.headers.get("host") || "localhost",
+        forwardedProto: url.protocol === "https:" ? "https" : "http",
+        forwardedPrefix: `/${appId}`,
+      },
+    });
+  } catch (e) {
+    if (e instanceof AppError && isRecoverableError(e)) {
+      // 惰性重启重试一次
+      console.warn(`custom proxy 失败，尝试惰性重启 app_id=${appId}`);
+      try {
+        const slot = app.active_slot || "a";
+        const codeDir = `${state.dataDir}/${appId}/deploy-${slot}`;
+        const runtimeDir = `${state.dataDir}/${appId}/runtime`;
+        await state.customProcessManager.startAndWait({
+          appId,
+          port: app.port,
+          codeDir,
+          runtimeDir,
+          entryFile: app.entry_file || "main.ts",
+        }, 10);
+        return await forward({
+          port: app.port,
+          path: upstreamPath,
+          method: req.method,
+          headers: new Headers(req.headers),
+          body,
+          maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+          proxyHeaders: {
+            forwardedHost: req.headers.get("host") || "localhost",
+            forwardedProto: url.protocol === "https:" ? "https" : "http",
+            forwardedPrefix: `/${appId}`,
+          },
+        });
+      } catch {
+        throw AppError.ServiceUnavailable(`App ${appId} 后端不可用`);
+      }
+    }
+    throw e;
+  }
+}
+
+/**
  * 静态文件根（/{app_id} 与 /{app_id}/ 共用）：path 始终为 ""。
  *
  * 对应 Rust serve_static_root（lib.rs:191-196）。
  */
 async function serveStaticRoot(
-  _req: Request,
+  req: Request,
   ctx: Ctx,
 ): Promise<Response> {
+  const app = await ctx.state.store.get(ctx.params.app_id);
+  if (app && app.type === "custom") {
+    return await serveCustomProxy(ctx.state, ctx.params.app_id, app, req, ctx);
+  }
   return await serveStaticImpl(ctx.state, ctx.params.app_id, "");
 }
 
@@ -592,9 +701,13 @@ async function serveStaticRoot(
  * 对应 Rust serve_static（lib.rs:198-203）。ctx.params.path 来自 wildcard。
  */
 async function serveStatic(
-  _req: Request,
+  req: Request,
   ctx: Ctx,
 ): Promise<Response> {
+  const app = await ctx.state.store.get(ctx.params.app_id);
+  if (app && app.type === "custom") {
+    return await serveCustomProxy(ctx.state, ctx.params.app_id, app, req, ctx);
+  }
   return await serveStaticImpl(
     ctx.state,
     ctx.params.app_id,

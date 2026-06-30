@@ -26,6 +26,11 @@ export function appStatusAsStr(status: AppStatus): AppStatus {
 }
 
 /**
+ * App 类型：pocketbase（标准 PocketBase 进程）或 custom（用户上传的静态/自定义服务）。
+ */
+export type AppType = "pocketbase" | "custom";
+
+/**
  * App 实体（一个 App = 一个 PocketBase 进程）。
  *
  * `superuser_email` / `superuser_password` 在 Rust 端带 `#[serde(default)]`，
@@ -35,6 +40,7 @@ export function appStatusAsStr(status: AppStatus): AppStatus {
 export interface App {
   id: string;
   name: string;
+  type: AppType;
   port: number;
   status: AppStatus;
   created_at: string;
@@ -43,6 +49,10 @@ export interface App {
   superuser_email: string;
   /** PocketBase superuser 密码（明文，与 apps.json 同级保护）。 */
   superuser_password: string;
+  /** custom 专用：当前激活的发布槽位（"a" | "b"），仅 type="custom" 时使用。 */
+  active_slot?: "a" | "b";
+  /** custom 专用：入口文件路径（如 "index.html"），仅 type="custom" 时使用。 */
+  entry_file?: string;
 }
 
 /** app_id 后缀允许的字符：小写 ASCII 字母或数字（显式避免 `\w` Unicode 陷阱）。 */

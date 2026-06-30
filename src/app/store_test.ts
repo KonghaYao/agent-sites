@@ -22,6 +22,7 @@ function make_app(id: string, port: number, status: AppStatus): App {
   return {
     id,
     name: `name-${id}`,
+    type: "pocketbase",
     port,
     status,
     created_at: "2026-06-19T10:00:00Z",
@@ -227,6 +228,31 @@ Deno.test("test_store_加载时_端口高于上限_被跳过", async () => {
     const apps = await store2.list();
     assertEquals(apps.length, 1, "越界端口（6379）应被跳过");
     assertEquals(apps[0].id, "app-aaa111");
+  } finally {
+    await cleanup(tempDir);
+  }
+});
+
+Deno.test("test_store_加载时_type字段缺失_默认pocketbase", async () => {
+  const { tempDir, path } = await makeTempStorePath();
+  try {
+    const oldJson = JSON.stringify({
+      apps: [{
+        id: "app-legacy01",
+        name: "legacy",
+        port: 9001,
+        status: "running",
+        created_at: "2026-06-19T10:00:00Z",
+        updated_at: "2026-06-19T10:00:00Z",
+        superuser_email: "",
+        superuser_password: "",
+      }],
+    });
+    await Deno.writeTextFile(path, oldJson);
+    const store = new AppStore(path, 9000, 11000);
+    const apps = await store.list();
+    assertEquals(apps.length, 1);
+    assertEquals(apps[0].type, "pocketbase");
   } finally {
     await cleanup(tempDir);
   }
