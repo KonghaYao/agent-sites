@@ -54,28 +54,30 @@ const SKIP_RESP_HEADERS = new Set([
   "connection",
 ]);
 
+/** forward 参数（选项对象风格）。 */
+export interface ForwardOptions {
+  port: number;
+  path: string;
+  method: string;
+  headers: Headers;
+  body: Uint8Array;
+  maxBodyBytes: number;
+  cookieScope?: string;
+  /** 自定义应用代理时注入的 X-Forwarded-* 头。 */
+  proxyHeaders?: {
+    forwardedHost: string;
+    forwardedProto: string;
+    forwardedPrefix: string;
+  };
+}
+
 /**
- * 转发请求到上游 PocketBase 实例。
- *
- * - `port`：PocketBase 监听端口
- * - `path`：上游路径（含 query），如 `/api/collections` 或 `/api/items?id=42`
- * - `method`/`headers`/`body`：透传
- * - `maxBodyBytes`：请求体上限，超过返回 413 PayloadTooLarge
- * - `cookieScope`：若给定 app_id，则把上游响应的 Set-Cookie 中 Path=/
- *   改写为 Path=/{app_id}/，保证 App 间 auth cookie 隔离
- * - 跳过 hop-by-hop headers（transfer-encoding、content-encoding、connection 等）
+ * 转发请求到上游 PocketBase 或自定义应用实例。
  *
  * 抛出 AppError 对应 Rust Result::Err。
  */
-export async function forward(
-  port: number,
-  path: string,
-  method: string,
-  headers: Headers,
-  body: Uint8Array,
-  maxBodyBytes: number,
-  cookieScope?: string,
-): Promise<Response> {
+export async function forward(opts: ForwardOptions): Promise<Response> {
+  const { port, path, method, headers, body, maxBodyBytes, cookieScope, proxyHeaders } = opts;
   // Issue #3：请求体大小限制
   if (body.byteLength > maxBodyBytes) {
     throw AppError.PayloadTooLarge(
@@ -93,6 +95,13 @@ export async function forward(
       continue;
     }
     upstreamHeaders.set(key, value);
+  }
+
+  // 自定义应用代理：注入 X-Forwarded-* 头
+  if (proxyHeaders) {
+    upstreamHeaders.set("X-Forwarded-Host", proxyHeaders.forwardedHost);
+    upstreamHeaders.set("X-Forwarded-Proto", proxyHeaders.forwardedProto);
+    upstreamHeaders.set("X-Forwarded-Prefix", proxyHeaders.forwardedPrefix);
   }
 
   // 构造请求 init：60s 超时等价 reqwest timeout

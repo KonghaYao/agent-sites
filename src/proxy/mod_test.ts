@@ -54,14 +54,14 @@ Deno.test("test_forward_get_透传响应", async () => {
   const upstream = make_upstream(port, `{"hello":"world"}`);
   await wait_upstream_ready(port);
   try {
-    const resp = await forward(
+    const resp = await forward({
       port,
-      "/api/echo",
-      "GET",
-      new Headers(),
-      new Uint8Array(),
-      MAX_BODY,
-    );
+      path: "/api/echo",
+      method: "GET",
+      headers: new Headers(),
+      body: new Uint8Array(),
+      maxBodyBytes: MAX_BODY,
+    });
     assertEquals(resp.status, 200);
     const text = await resp.text();
     assertEquals(text, `{"hello":"world"}`);
@@ -74,14 +74,14 @@ Deno.test("test_forward_上游不存在_返回502", async () => {
   // 选一个几乎肯定没占用的端口；连接失败应抛 AppError(code=INTERNAL_ERROR)
   let caught: unknown;
   try {
-    await forward(
-      23999,
-      "/api/whatever",
-      "GET",
-      new Headers(),
-      new Uint8Array(),
-      MAX_BODY,
-    );
+    await forward({
+      port: 23999,
+      path: "/api/whatever",
+      method: "GET",
+      headers: new Headers(),
+      body: new Uint8Array(),
+      maxBodyBytes: MAX_BODY,
+    });
   } catch (e) {
     caught = e;
   }
@@ -106,14 +106,14 @@ Deno.test("test_forward_透传查询参数", async () => {
   );
   await wait_upstream_ready(port);
   try {
-    const resp = await forward(
+    const resp = await forward({
       port,
-      "/api/items?id=42",
-      "GET",
-      new Headers(),
-      new Uint8Array(),
-      MAX_BODY,
-    );
+      path: "/api/items?id=42",
+      method: "GET",
+      headers: new Headers(),
+      body: new Uint8Array(),
+      maxBodyBytes: MAX_BODY,
+    });
     const text = await resp.text();
     assertEquals(text, `{"id":"42"}`);
   } finally {
@@ -131,14 +131,14 @@ Deno.test("test_forward_请求体超过上限_返回413", async () => {
     const bigBody = new Uint8Array(100).fill("a".charCodeAt(0));
     let caught: unknown;
     try {
-      await forward(
+      await forward({
         port,
-        "/api/echo",
-        "POST",
-        new Headers(),
-        bigBody,
-        10,
-      );
+        path: "/api/echo",
+        method: "POST",
+        headers: new Headers(),
+        body: bigBody,
+        maxBodyBytes: 10,
+      });
     } catch (e) {
       caught = e;
     }
@@ -169,15 +169,15 @@ Deno.test("test_forward_上游_set_cookie_被改写到_app_前缀", async () => 
   );
   await wait_upstream_ready(port);
   try {
-    const resp = await forward(
+    const resp = await forward({
       port,
-      "/api/login",
-      "GET",
-      new Headers(),
-      new Uint8Array(),
-      MAX_BODY,
-      "app-abcdef12",
-    );
+      path: "/api/login",
+      method: "GET",
+      headers: new Headers(),
+      body: new Uint8Array(),
+      maxBodyBytes: MAX_BODY,
+      cookieScope: "app-abcdef12",
+    });
     const setCookie = resp.headers.get("set-cookie") ?? "";
     assertEquals(
       setCookie.includes("Path=/app-abcdef12"),
@@ -225,14 +225,14 @@ Deno.test("test_forward_上游_204_无_body", async () => {
   );
   await wait_upstream_ready(port);
   try {
-    const resp = await forward(
+    const resp = await forward({
       port,
-      "/api/items/1",
-      "DELETE",
-      new Headers(),
-      new Uint8Array(),
-      MAX_BODY,
-    );
+      path: "/api/items/1",
+      method: "DELETE",
+      headers: new Headers(),
+      body: new Uint8Array(),
+      maxBodyBytes: MAX_BODY,
+    });
     assertEquals(resp.status, 204);
     const text = await resp.text();
     assertEquals(text, "", "204 响应必须无 body");
@@ -254,14 +254,14 @@ Deno.test("test_forward_上游_304_无_body", async () => {
   );
   await wait_upstream_ready(port);
   try {
-    const resp = await forward(
+    const resp = await forward({
       port,
-      "/api/items/1",
-      "GET",
-      new Headers(),
-      new Uint8Array(),
-      MAX_BODY,
-    );
+      path: "/api/items/1",
+      method: "GET",
+      headers: new Headers(),
+      body: new Uint8Array(),
+      maxBodyBytes: MAX_BODY,
+    });
     assertEquals(resp.status, 304);
     const text = await resp.text();
     assertEquals(text, "", "304 响应必须无 body");
