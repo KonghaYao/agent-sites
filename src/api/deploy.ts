@@ -232,8 +232,6 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
 
   // 7. 分配新端口
   const usedPorts = await state.store.usedPorts();
-  // 加当前 app 自己占用的端口（避免 PortAllocator 看不到自定义端口）
-  if (app.port > 0) usedPorts.delete(app.port);
   const allocator = new PortAllocator(state.portMin, state.portMax);
   const newPort = allocator.allocate(usedPorts);
   if (newPort === 0) throw AppError.Internal("端口范围耗尽");
