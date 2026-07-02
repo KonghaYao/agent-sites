@@ -64,6 +64,8 @@ export type Handler = (req: Request, ctx: Ctx) => Promise<Response>;
 export interface CreateAppRequest {
   name?: string;
   type?: "pocketbase" | "custom";
+  /** custom 专用：是否启用平台托管的 PocketBase 实例。仅 type="custom" 时有效，缺省 false。 */
+  enable_pb?: boolean;
 }
 
 /** App 响应体（不含任何敏感字段——凭证仅存内部 store，不外露）。 */
@@ -75,6 +77,10 @@ export interface AppResponse {
   status: string;
   api_path: string;
   created_at: string;
+  /** custom + enable_pb 时返回 true。 */
+  enable_pb?: boolean;
+  /** custom + enable_pb 时返回 PB 实例端口。 */
+  pb_port?: number;
 }
 
 /**
@@ -88,7 +94,7 @@ export interface AppResponse {
  * 由 /api/tokens 签发，凭证本身只在内部 store 中。
  */
 export function toAppResponse(a: App): AppResponse {
-  return {
+  const resp: AppResponse = {
     id: a.id,
     name: a.name,
     type: a.type,
@@ -97,6 +103,11 @@ export function toAppResponse(a: App): AppResponse {
     api_path: a.type === "custom" ? `/${a.id}` : `/${a.id}/api`,
     created_at: a.created_at,
   };
+  if (a.type === "custom" && a.enable_pb) {
+    resp.enable_pb = true;
+    resp.pb_port = a.pb_port;
+  }
+  return resp;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,11 +243,67 @@ export async function createApp(
     throw AppError.Internal(`持久化失败: ${e}`);
   }
 
-  // custom 类型：只创建目录 + 标记 running，不需要 PocketBase
+  // custom 类型：创建目录。如果 enable_pb=true 则额外 spawn PocketBase 实例。
   if (appType === "custom") {
     const dataDir = `${state.dataDir}/${id}`;
     await Deno.mkdir(dataDir, { recursive: true });
     await Deno.mkdir(`${dataDir}/runtime`, { recursive: true });
+
+    const enablePb = requestBody.enable_pb === true;
+
+    if (enablePb) {
+      const superuserEmail = `admin@${id}.local`;
+      const superuserPassword = crypto.randomUUID().replace(/-/g, "");
+
+      // 预置 superuser（spawn 前）
+      try {
+        initSuperuser(
+          state.pbBinary,
+          dataDir,
+          superuserEmail,
+          superuserPassword,
+        );
+      } catch (e) {
+        await state.store.remove(app.id);
+        await state.store.flush().catch(() => {});
+        throw AppError.Internal(`预置 superuser 失败: ${e}`);
+      }
+
+      // spawn PB（含端口分配 + 健康检查）
+      const cookiePath = `/${id}/`;
+      let actualPbPort: number;
+      try {
+        actualPbPort = await state.processManager.start(
+          id,
+          dataDir,
+          cookiePath,
+          allocator,
+        );
+      } catch (e) {
+        await state.store.remove(app.id);
+        await state.store.flush().catch(() => {});
+        await Deno.remove(dataDir, { recursive: true }).catch(() => {});
+        throw e instanceof AppError ? e : AppError.Internal(`${e}`);
+      }
+
+      // 验证 superuser 凭证可用（消除异步落盘竞态）
+      try {
+        await verifySuperuserReady(
+          actualPbPort,
+          superuserEmail,
+          superuserPassword,
+        );
+      } catch (e) {
+        console.warn(
+          `superuser 凭证验证失败 app_id=${id} error=${(e as Error).message}`,
+        );
+      }
+
+      app.enable_pb = true;
+      app.pb_port = actualPbPort;
+      app.superuser_email = superuserEmail;
+      app.superuser_password = superuserPassword;
+    }
 
     app.status = "running";
     app.updated_at = new Date().toISOString();

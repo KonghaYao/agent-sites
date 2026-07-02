@@ -54,15 +54,24 @@ export class AppStore {
     // 向前兼容：没有 type 字段的旧记录默认为 pocketbase
     for (const a of apps) {
       if (!a.type) (a as unknown as Record<string, unknown>).type = "pocketbase";
+      // custom 向前兼容：没有 enable_pb 字段的旧记录默认为 false
+      if (a.type === "custom" && a.enable_pb === undefined) a.enable_pb = false;
+      if (a.type === "custom" && a.pb_port === undefined) a.pb_port = 0;
     }
     // 端口范围校验（SSRF 防护）：越界端口跳过
     this.apps = apps.filter((a) => {
-      if (a.port < portMin || a.port > portMax) {
-        console.error(
-          `App 端口越界，跳过加载（疑似 apps.json 被篡改）` +
-            ` app_id=${a.id} port=${a.port} min=${portMin} max=${portMax}`,
-        );
-        return false;
+      const portsToCheck: number[] = [];
+      if (a.port > 0) portsToCheck.push(a.port);
+      // custom + enable_pb 的 pb_port 也需校验（防止篡改 apps.json 指向非法端口）
+      if (a.type === "custom" && a.pb_port && a.pb_port > 0) portsToCheck.push(a.pb_port);
+      for (const p of portsToCheck) {
+        if (p < portMin || p > portMax) {
+          console.error(
+            `App 端口越界，跳过加载（疑似 apps.json 被篡改）` +
+              ` app_id=${a.id} port=${p} min=${portMin} max=${portMax}`,
+          );
+          return false;
+        }
       }
       return true;
     });

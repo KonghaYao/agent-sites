@@ -8,7 +8,7 @@ description: Agent Sites 平台建站部署。当需要在平台上创建 App、
 在 Agent Sites 平台上建站。支持两种模式：
 
 - **经典模式**（本文档）：一个独立 PocketBase 后端 + 前端静态目录。适合静态前端 + 简单 CRUD 后端。
-- **自定义应用模式**：上传自包含 Deno 应用（`main.ts`/`main.js`），平台 spawn 子进程 + 全量代理。适合任意全栈应用。详见 [`custom-app-mode.md`](custom-app-mode.md)。
+- **自定义应用模式**：上传自包含 Deno 应用（`main.ts`/`main.js`），平台 spawn 子进程 + 全量代理。适合任意全栈应用。可选 `"enable_pb": true` 启用平台托管的 PocketBase 实例。详见 [`custom-app-mode.md`](custom-app-mode.md)。
 
 > 下面的 Quick Start 和所有细节针对**经典模式**。自定义应用模式的部署方式不同——创建时加 `"type":"custom"`，通过 `POST /api/apps/{id}/deploy` 上传 gzip 包。
 
@@ -40,6 +40,8 @@ echo "APP_ID=$APP_ID"   # 形如 app-abcd1234
 
 name 只允许 `[a-z0-9-]`、长度 1..32；中文/大写/空格/下划线会被 400 拒绝。name 也可省略，缺省时用 id 当 name。
 
+> **AppResponse 字段**：成功响应 `data` 含 `id` / `name` / `type` / `port` / `status` / `api_path` / `created_at`。其中 `api_path` 是后端入口（pocketbase 类型 → `/{id}/api`，custom 类型 → `/{id}`），`port` 为内部分配端口（custom 类型未部署前为 0）。custom + `enable_pb: true` 时额外返回 `enable_pb: true` / `pb_port`（PB 实例端口）。**注意没有 `updated_at` 字段**。响应壳是 `{ data: AppResponse, error: null }`。
+
 ### 2. 申请 platform token
 
 仅展示一次，立即存起来；丢了只能重新申请、吊销旧的。同时存 `token`（调用用）和 `token_id`（吊销用）：
@@ -52,6 +54,8 @@ RESP=$(curl -s -X POST $AGENT_SITES_URL/api/tokens \
 TOKEN=$(echo "$RESP" | jq -r '.data.token')
 TOKEN_ID=$(echo "$RESP" | jq -r '.data.token_id')
 ```
+
+> **CreateTokenResponse 字段**：`token_id` / `app_id` / `token` / `status`（恒为 `"active"`）/ `issued_at` / `warning`（中文提示语）。token 永久有效、无 expiry、无 refresh；`last_used_at` 字段 schema 占位但**平台不维护**（永久 null，不要靠它判断是否在用）。
 
 ### 3. 配后端 collection
 
@@ -77,7 +81,7 @@ curl -s -X POST $AGENT_SITES_URL/$APP_ID/api/collections \
   }' | jq '.name'   # → "messages"
 ```
 
-> 极少数情况下，createApp 返回后立即建 collection 会返 `503 PB_UNAVAILABLE`（PB superuser 凭证仍在异步落盘）。等 1-2 秒重试同一请求即可，不要重建 app。
+> createApp 返回前平台已主动 `auth-with-password` 验证 superuser 凭证（重试 3 次、每次间隔 500ms），消除"凭证异步落盘"竞态。极少数情况下验证超时但 PM 已启动——首次代理仍可能返 `503 PB_UNAVAILABLE`，等 1-2 秒重试同一请求即可，不要重建 app。
 
 ### 4. 写前端并上传
 
@@ -258,12 +262,36 @@ curl -s -X DELETE $AGENT_SITES_URL/api/tokens/$TOKEN_ID \
 
 丢了 `token_id` 可反查：`curl -s "$AGENT_SITES_URL/api/tokens?app_id=$APP_ID" -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" | jq '.data[].token_id'`。
 
+**忘了 APP_ID 反查**：
+
+```bash
+# 列出所有 app（含 id/name/type/status/api_path）
+curl -s $AGENT_SITES_URL/api/apps -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" | jq '.data[]'
+
+# 查单个 app
+curl -s $AGENT_SITES_URL/api/apps/$APP_ID -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" | jq '.data'
+```
+
+**删除 App**（按 id，真删不可恢复）：
+
+```bash
+curl -s -X DELETE $AGENT_SITES_URL/api/apps/$APP_ID \
+  -H "X-Master-Key: $AGENT_SITES_MASTER_KEY" | jq '.data.deleted'
+# 响应：{ data: { deleted: "<app_id>" }, error: null }
+```
+
+DELETE 会停 PB / 自定义进程 + 删 `data/app-{id}/` + 删 `public/app-{id}/` + 吊销该 app 所有 token，全部立即生效。
+
 ## 实操要点
 
 - **Platform token 只展示一次**。响应里 `.data.token` 要立即存起来；丢了只能重新申请、吊销旧的。
-- **前端 fetch 自动重写**：浏览器 GET HTML 时平台会注入 shim，把 `fetch('/api/x')` 自动重写成 `fetch('/{app_id}/api/x')`。所以前端里绝对路径 `/api/...` 直接用。
+- **前端 fetch 自动重写**：浏览器 GET HTML 时平台会注入 shim，把 `fetch('/api/x')` 自动重写成 `fetch('/{app_id}/api/x')`。所以前端里绝对路径 `/api/...` 直接用。仅对 `text/html` 注入，且只覆盖字符串/Request 形式的 `fetch`。
 - **fetch 以外的路径要手动改相对路径**：`<a href>`、`<img src>`、`<link href>`、`axios`、`XMLHttpRequest` 不被 shim 覆盖，写成相对路径（`./api/x` 或 `api/x`）。
 - **后端公开访问靠 rules**：collection 创建时 `listRule`/`viewRule`/`createRule` 设为 `""` 表示允许匿名；设 `null` 表示禁用；设表达式表示条件。业务前端匿名访问就靠这个。
-- **上传用 `--data-binary`**，不是 `-F`（multipart）。后缀白名单：html/htm/css/js/json/svg/png/jpg/jpeg/webp/ico/txt/map。
+- **Admin UI 不开放**：`/{app_id}/_/`（PocketBase Admin UI）显式拦截，返回 404 + `"Admin UI 不开放，请用 platform token + API"`。只能通过 platform token + API 操作 collections，不能用浏览器登录 Admin。
+- **上传用 `--data-binary`**，不是 `-F`（multipart）。后缀白名单：html/htm/css/js/json/svg/png/jpg/jpeg/webp/ico/txt/map。bundle 解压后单文件 ≤ 5 MiB。
 - **DELETE App 是真删**：停后端 + 删数据 + 删前端，不可恢复，且吊销该 App 所有 token。
-- **响应取值**：平台路由（`/api/apps*`、`/api/tokens*`、文件上传）用 `jq '.data.xxx'`；后端代理（`/{app_id}/api/*`）是 PocketBase 原生格式，列表用 `jq '.items'`、总数 `.totalItems`。出错看 `.error.message` 或 `.message`。
+- **响应取值**：平台路由（`/api/apps*`、`/api/tokens*`、文件上传）用 `jq '.data.xxx'`；后端代理（`/{app_id}/api/*`）是 PocketBase 原生格式，列表用 `jq '.items'`、总数 `.totalItems`。
+- **错误响应结构**：平台路由错误统一返 `{ data: null, error: { code, message, request_id? } }`，HTTP 状态码与 code 对应——`400 BAD_REQUEST` / `401 UNAUTHORIZED`（master key 缺失或错误、token 已吊销/不存在）/ `403 FORBIDDEN`（token 与 app_id 不匹配）/ `404 NOT_FOUND` / `409 CONFLICT`（app 数量超上限，默认 50，由 `MAX_APPS` 环境变量控制）/ `413 PAYLOAD_TOO_LARGE` / `503 PB_UNAVAILABLE`（PB 后端不可达或多次重启失败）/ `500 INTERNAL_ERROR`（消息已 sanitize 为「服务器内部错误」）。`request_id` 可用于关联平台日志。后端代理错误是 PocketBase 原生壳 `{ data, message, status }`，不在平台层 sanitize。
+- **代理请求体上限 50 MiB**：后端代理（`/{app_id}/api/*`、自定义应用代理）单次请求 body 上限 `DEFAULT_MAX_BODY_BYTES = 50 MiB`，超限返 413。批量上传 records 时注意控制。
+- **PocketBase 健康检查 10 秒超时**：创建/重启 PocketBase 时平台做 TCP 探活，10 秒内未 listen 端口 → createApp/restartIfNeeded 抛 HTTP 500 `INTERNAL_ERROR`（message sanitize），原始 `"PocketBase 健康检查超时（10s）"` 仅日志可见。

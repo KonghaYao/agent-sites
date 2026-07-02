@@ -597,12 +597,44 @@ async function serveCustomProxy(
   req: Request,
   _ctx: Ctx,
 ): Promise<Response> {
+  // 构建 PB 连接参数（enable_pb 时使用）
+  const buildPbParams = (): {
+    pbUrl?: string;
+    pbSuperuserEmail?: string;
+    pbSuperuserPassword?: string;
+  } => {
+    if (app.enable_pb && app.pb_port && app.pb_port > 0) {
+      return {
+        pbUrl: `http://127.0.0.1:${app.pb_port}`,
+        pbSuperuserEmail: app.superuser_email,
+        pbSuperuserPassword: app.superuser_password,
+      };
+    }
+    return {};
+  };
+
   // 惰性重启：进程不在则启动
   if (!state.customProcessManager.isAlive(appId)) {
     const slot = app.active_slot || "a";
     const entryFile = app.entry_file || "main.ts";
     const codeDir = `${state.dataDir}/${appId}/deploy-${slot}`;
     const runtimeDir = `${state.dataDir}/${appId}/runtime`;
+
+    // enable_pb：确保 PB 进程存活后再启动 custom 进程
+    if (app.enable_pb && app.pb_port && app.pb_port > 0) {
+      const pbAllocator = new PortAllocator(state.portMin, state.portMax);
+      try {
+        await state.processManager.restartIfNeeded(
+          appId,
+          `${state.dataDir}/${appId}`,
+          pbAllocator,
+        );
+      } catch (e) {
+        console.warn(
+          `惰性重启: PB 重启失败 app_id=${appId} error=${(e as Error).message}`,
+        );
+      }
+    }
 
     try {
       await state.customProcessManager.startAndWait({
@@ -611,6 +643,7 @@ async function serveCustomProxy(
         codeDir,
         runtimeDir,
         entryFile,
+        ...buildPbParams(),
       }, 10);
     } catch (e) {
       console.error(
@@ -657,6 +690,7 @@ async function serveCustomProxy(
           codeDir,
           runtimeDir,
           entryFile: app.entry_file || "main.ts",
+          ...buildPbParams(),
         }, 10);
         return await forward({
           port: app.port,

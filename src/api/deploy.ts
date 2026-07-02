@@ -236,6 +236,28 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
   const newPort = allocator.allocate(usedPorts);
   if (newPort === 0) throw AppError.Internal("端口范围耗尽");
 
+  // 7b. 如果 enable_pb，确保 PB 进程存活
+  let pbUrl: string | undefined;
+  let pbSuperuserEmail: string | undefined;
+  let pbSuperuserPassword: string | undefined;
+  if (app.enable_pb && app.pb_port && app.pb_port > 0) {
+    try {
+      await state.processManager.restartIfNeeded(
+        id,
+        `${state.dataDir}/${id}`,
+        allocator,
+      );
+    } catch (e) {
+      console.warn(
+        `enable_pb: PB 重启失败 app_id=${id} error=${(e as Error).message}`,
+      );
+      throw AppError.ServiceUnavailable(`App ${id} PB 后端不可用`);
+    }
+    pbUrl = `http://127.0.0.1:${app.pb_port}`;
+    pbSuperuserEmail = app.superuser_email;
+    pbSuperuserPassword = app.superuser_password;
+  }
+
   // 8. 启动新进程 + 探活
   const oldPort = app.port;
   await state.customProcessManager.startAndWait({
@@ -244,6 +266,9 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
     codeDir: deployDir,
     runtimeDir,
     entryFile,
+    pbUrl,
+    pbSuperuserEmail,
+    pbSuperuserPassword,
   }, 10);
 
   // 9. 原子切换
@@ -270,6 +295,7 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
       entry_file: entryFile,
       slot: targetSlot,
       port: newPort,
+      ...(app.enable_pb && pbUrl ? { pb_url: pbUrl } : {}),
     },
     error: null,
   });

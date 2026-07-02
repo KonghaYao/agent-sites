@@ -53,6 +53,10 @@ export interface App {
   active_slot?: "a" | "b";
   /** custom 专用：入口文件路径（如 "index.html"），仅 type="custom" 时使用。 */
   entry_file?: string;
+  /** custom 专用：是否启用平台托管的 PocketBase 实例。缺省 false。 */
+  enable_pb?: boolean;
+  /** custom 专用：PB 实例监听端口（127.0.0.1，仅 enable_pb=true 时有效）。 */
+  pb_port?: number;
 }
 
 /** app_id 后缀允许的字符：小写 ASCII 字母或数字（显式避免 `\w` Unicode 陷阱）。 */

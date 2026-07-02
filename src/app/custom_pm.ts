@@ -12,6 +12,10 @@ export interface CustomAppStartParams {
   codeDir: string; // 代码目录（deploy-a 或 deploy-b）
   runtimeDir: string; // 运行时数据目录（cwd）
   entryFile: string; // "main.ts" 或 "main.js"
+  /** PB 连接信息（enable_pb=true 时传入）。custom 进程通过 PB SDK 直连此 URL。 */
+  pbUrl?: string;
+  pbSuperuserEmail?: string;
+  pbSuperuserPassword?: string;
 }
 
 /**
@@ -40,13 +44,22 @@ export class CustomProcessManager {
   /**
    * 启动自定义应用子进程。
    *
-   * 约定：deno run --allow-net --allow-env=PORT
+   * 约定：deno run --allow-net --allow-env=PORT,PB_URL,PB_SUPERUSER_EMAIL,PB_SUPERUSER_PASSWORD
    *       --allow-read=<codeDir> --allow-read=<runtimeDir>
    *       --allow-write=<runtimeDir> <entryFile>
-   * PORT 环境变量注入分配的端口。
+   * PORT / PB_URL / PB_SUPERUSER_EMAIL / PB_SUPERUSER_PASSWORD 由平台注入。
    */
   start(params: CustomAppStartParams): ManagedProcess {
-    const { appId, port, codeDir, runtimeDir, entryFile } = params;
+    const {
+      appId,
+      port,
+      codeDir,
+      runtimeDir,
+      entryFile,
+      pbUrl,
+      pbSuperuserEmail,
+      pbSuperuserPassword,
+    } = params;
 
     // 如果已在运行，先停
     const existing = this.processes.get(appId);
@@ -54,11 +67,27 @@ export class CustomProcessManager {
       existing.startKill();
     }
 
+    // 构建环境变量白名单
+    const envVars: Record<string, string> = { ...customEnvWhitelist(), PORT: String(port) };
+    const allowEnv = ["PORT"];
+    if (pbUrl) {
+      envVars["PB_URL"] = pbUrl;
+      allowEnv.push("PB_URL");
+    }
+    if (pbSuperuserEmail) {
+      envVars["PB_SUPERUSER_EMAIL"] = pbSuperuserEmail;
+      allowEnv.push("PB_SUPERUSER_EMAIL");
+    }
+    if (pbSuperuserPassword) {
+      envVars["PB_SUPERUSER_PASSWORD"] = pbSuperuserPassword;
+      allowEnv.push("PB_SUPERUSER_PASSWORD");
+    }
+
     const command = new Deno.Command("deno", {
       args: [
         "run",
         "--allow-net",
-        "--allow-env=PORT",
+        `--allow-env=${allowEnv.join(",")}`,
         `--allow-read=${codeDir}`,
         `--allow-read=${runtimeDir}`,
         `--allow-write=${runtimeDir}`,
@@ -69,7 +98,7 @@ export class CustomProcessManager {
       stdout: "null",
       stderr: "null",
       clearEnv: true,
-      env: { ...customEnvWhitelist(), PORT: String(port) },
+      env: envVars,
     });
 
     let child: Deno.ChildProcess;
