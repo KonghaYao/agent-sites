@@ -341,7 +341,7 @@ echo "APP_ID=$APP_ID"
 
 ```typescript
 // main.ts —— 带 PB 后端的自定义应用
-import PocketBase from "jsr:@pocketbase/pocketbase";
+import PocketBase from "npm:pocketbase";
 
 const port = parseInt(Deno.env.get("PORT") || "8080");
 const pbUrl = Deno.env.get("PB_URL"); // 平台注入，仅 enable_pb 时存在
@@ -427,7 +427,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (req) => {
 
 **关键约定：**
 
-- **PB SDK 是 `jsr:@pocketbase/pocketbase`**（Deno native import）
+- **PB SDK 是 `npm:pocketbase`**（Deno 原生支持 npm specifier）
 - **PB 只监听 127.0.0.1**，外部不可达。custom 进程以 superuser 身份直连
 - **superuser 密码只在子进程环境变量中出现**，不出 HTTP 响应
 - **前端 API 调用走 custom 进程中转**（不走 platform token）。前端 `fetch("./api/posts")` → custom 进程 → PB SDK

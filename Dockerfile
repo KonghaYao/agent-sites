@@ -26,8 +26,8 @@ COPY src ./src
 RUN deno cache src/main.ts
 
 # Pre-cache PocketBase JS SDK 用于 custom app（避免首次 deploy 冷启动 >10s 探活超时）。
-# 不 pin 版本——Deno 运行时会用缓存中的最新解析结果；custom app 代码 import 也无需带版本号。
-RUN deno cache jsr:@pocketbase/pocketbase
+# SDK 是 npm 包，不是 JSR 包。不 pin 版本——custom app 代码 import 也无需带版本号。
+RUN deno cache npm:pocketbase
 
 # COPY 前端静态文件：
 #   - public/       → 运行时目录（用户上传的前端文件 + 控制面板）
