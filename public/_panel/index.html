@@ -1278,6 +1278,8 @@
   updateMkBadge();
   setLive(false);
   tick();
+  // initialize detail view on page load (if hash present)
+  handleHash();
   if (polling) startPolling();
 })();
 </script>
