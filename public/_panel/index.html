@@ -686,6 +686,35 @@
 
   baseUrlEl.textContent = location.origin;
 
+  // ---------- token lifecycle ----------
+  async function acquireToken(appId) {
+    const mk = getMK();
+    if (!mk) return null;
+    try {
+      const r = await fetch("/api/tokens", {
+        method: "POST",
+        headers: { "X-Master-Key": mk, "Content-Type": "application/json" },
+        body: JSON.stringify({ app_id: appId }),
+      });
+      if (!r.ok) return null;
+      const j = await r.json();
+      return j.data ? { token: j.data.token, token_id: j.data.token_id } : null;
+    } catch { return null; }
+  }
+
+  async function releaseToken() {
+    if (!detailToken) return;
+    const mk = getMK();
+    if (!mk) return;
+    try {
+      await fetch(`/api/tokens/${encodeURIComponent(detailToken.token_id)}`, {
+        method: "DELETE",
+        headers: { "X-Master-Key": mk },
+      });
+    } catch {}
+    detailToken = null;
+  }
+
   // ---------- helpers ----------
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => (
