@@ -245,7 +245,7 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
       await state.processManager.restartIfNeeded(
         id,
         `${state.dataDir}/${id}`,
-        allocator,
+        app.pb_port!,
       );
     } catch (e) {
       console.warn(

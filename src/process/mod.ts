@@ -291,7 +291,7 @@ export class PocketBaseProcessManager {
     this.processes.set(appId, new ManagedProcess(child, port));
 
     // === 健康检查 ===
-    const healthy = await waitForHealth(port, 10);
+    const healthy = await waitForHealth(port, 30);
     if (!healthy) {
       // 失败：kill + 移除
       try {
@@ -362,7 +362,7 @@ export class PocketBaseProcessManager {
    */
   isAlive(appId: string): boolean {
     const p = this.processes.get(appId);
-    if (!p) return false;
+    if (!p || !p.isAlive) return false;
     return p.isAlive();
   }
 
@@ -371,19 +371,22 @@ export class PocketBaseProcessManager {
    *
    * 调用前提：调用方已经判断需要自愈（is_alive=false 或 forward 失败）。
    *
+   * port 由调用方提供（来自 App.port 或 App.pb_port），不再随机分配。
+   * 这保证了每个 App 的端口固定，且避免了并发重启时的 TOCTOU 竞态。
+   *
    * 流程：
    * 1. 限流检查：5min×3 次超限 → RateLimited
-   * 2. 拿原端口（PM 没记录则分配新端口）
-   * 3. 同步段内：二次确认（try_wait）。还活着 → StillHealthy
-   * 4. 锁外：端口冲突处理（如果端口被占）→ 验证 cmdline 是 pocketbase 才 kill
-   * 5. 同步段内：用原端口 spawn → 写入 processes map
-   * 6. 锁外 wait_for_health，超时 → GiveUp（回滚 kill + remove）
-   * 7. 返回 Restarted
+   * 2. 清理旧 entry + 插入临时占位（← TOCTOU 防护：阻塞其他请求分到同端口）
+   * 3. 端口冲突处理：isPortInUse → findAndKillConflictingPb →
+   *    非 "killed" 则 GiveUp（释放占位）
+   * 4. spawn → 用真 ManagedProcess 替换占位
+   * 5. 健康检查 → 失败则 stop + GiveUp
+   * 6. 返回 Restarted
    */
   async restartIfNeeded(
     appId: string,
     dataDir: string,
-    allocator: PortAllocator,
+    port: number,
   ): Promise<RestartOutcome> {
     // 注：测试串行化在测试代码层用 withTestSpawnLock 包装；此处不能再调
     // withTestSpawnLock，否则与外层测试锁嵌套 → 死锁。
@@ -393,48 +396,43 @@ export class PocketBaseProcessManager {
       return "RateLimited" as RestartOutcome;
     }
 
-    // === 2. 拿原端口 ===
+    // === 2. 清理旧 entry + 插入临时占位（在 async 之前！）===
+    // 占位作用：让其他并发重启请求通过 processes.values() 看到该端口已被占用，
+    // 从而消除 TOCTOU 竞态（修复：三个 PB 同时分配到同一端口的 bug）。
     const existingProc = this.processes.get(appId);
-    const port: number = existingProc ? existingProc.port : (() => {
-      // PM 没记录该 app_id：分配新端口
-      const used: Set<number> = new Set();
-      for (const p of this.processes.values()) used.add(p.port);
-      const newPort = allocator.allocate(used);
-      if (newPort === 0) {
-        throw AppError.Internal("端口范围耗尽");
-      }
-      return newPort;
-    })();
-
-    // === 3. 二次确认（同步段，不跨 await） ===
-    const existing2 = this.processes.get(appId);
-    if (existing2) {
-      if (existing2.isAlive()) {
+    if (existingProc) {
+      if (existingProc.isAlive?.()) {
         // 还活着（race）→ 不重启
         return "StillHealthy" as RestartOutcome;
       }
-      // 已退出 → 从 map 移除
+      // 已退出 → 清理
       this.processes.delete(appId);
     }
+    this.processes.set(appId, { port } as ManagedProcess);
 
-    // === 4. 端口冲突处理 ===
+    // === 3. 端口冲突处理 ===
     if (await PocketBaseProcessManager.isPortInUse(port)) {
       const outcome = await PocketBaseProcessManager
         .findAndKillConflictingPb(port, appId);
       if (outcome === "killed") {
         // 已 kill，继续 spawn
       } else if (outcome === "not-target") {
+        this.processes.delete(appId); // 释放占位
         console.error(
           `端口被非 pocketbase 进程占用，放弃重启避免误杀 app_id=${appId} port=${port}`,
         );
         return "GiveUp" as RestartOutcome;
       } else {
+        this.processes.delete(appId); // 释放占位
         // outcome === 'detect-error'
-        console.warn(`端口冲突检测失败，继续尝试 spawn port=${port}`);
+        console.error(
+          `端口冲突检测/清理失败，放弃重启避免端口冲突 app_id=${appId} port=${port}`,
+        );
+        return "GiveUp" as RestartOutcome;
       }
     }
 
-    // === 5. spawn（同步段，spawn 不跨 await） ===
+    // === 4. spawn（用真 ManagedProcess 替换占位）===
     const args = buildServeArgs(dataDir, port, `/${appId}/`);
     console.info(
       `重启 PocketBase 进程 app_id=${appId} port=${port} args=${JSON.stringify(args)}`,
@@ -455,12 +453,13 @@ export class PocketBaseProcessManager {
       });
       child = command.spawn();
     } catch (e) {
+      this.processes.delete(appId); // 释放占位
       throw AppError.Internal(`PocketBase 重启 spawn 失败: ${e}`);
     }
     this.processes.set(appId, new ManagedProcess(child, port));
 
-    // === 6. health check ===
-    const healthy = await waitForHealth(port, 10);
+    // === 5. 健康检查 ===
+    const healthy = await waitForHealth(port, 30);
     if (!healthy) {
       console.error(`重启后健康检查失败，GiveUp app_id=${appId} port=${port}`);
       try {
@@ -550,8 +549,11 @@ export class PocketBaseProcessManager {
       if (isPb && matchesApp) {
         try {
           await runCmd("kill", ["-9", pid]);
-        } catch {
-          // 忽略 kill 失败
+        } catch (e) {
+          console.warn(
+            `kill 失败，无法释放端口 port=${port} pid=${pid} error=${e}`,
+          );
+          return "detect-error";
         }
         await delay(300);
         return "killed";

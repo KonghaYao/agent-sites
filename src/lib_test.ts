@@ -533,9 +533,14 @@ Deno.test({
       assertEquals(proxied.status, 503);
       await proxied.body?.cancel();
 
-      // status 应同步为 Error
+      // status 应同步为 Error，并记录原因
       const updated = await state.store.get(appId);
       assertEquals(updated!.status, "error");
+      assertEquals(
+        updated!.status_reason,
+        "5分钟内重启超限（3次）",
+        "RateLimited 时应记录具体原因",
+      );
 
       // 清理
       const del = await dispatch(handler, "DELETE", `/api/apps/${appId}`);

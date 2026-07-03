@@ -19,6 +19,7 @@
 //   此处用动态 import + 运行时检查，若 lib.ts 存在则调用其 createApp；
 //   若缺失则在 main 启动早期抛出明确错误。这样 main.ts 可先于 lib.ts 落地。
 
+import type { AppStatus } from "./app/model.ts";
 import { AppState } from "./state.ts";
 import { AppStore } from "./app/store.ts";
 import { PocketBaseProcessManager } from "./process/mod.ts";
@@ -265,6 +266,60 @@ async function main(): Promise<void> {
 
   // 加载 handler（对应 agent_sites::create_app(state)，main.rs:62）
   const handler = await loadCreateApp(state);
+
+  // === 启动自愈：修复上次运行可能遗留的脏状态 ===
+  // 生产环境可能出现：PB 被 SIGKILL 强杀残留 WAL/SHM、createApp 中断留
+  // starting 状态、懒恢复失败标记 error。启动时统一清理，给懒恢复一个干净起点。
+  let healedCount = 0;
+  try {
+    const apps = await state.store.list();
+    for (const app of apps) {
+      let appHealed = false;
+
+      // 1. 清除未正常关闭的 SQLite WAL/SHM 文件（SIGKILL 残留）
+      //    PB 在 WAL 模式下 kill -9 后会留下 .db-wal / .db-shm 文件。
+      //    PB 自带恢复逻辑，删除后下次启动会回滚/重放 WAL 到主数据库。
+      try {
+        const dataDir = `${state.dataDir}/${app.id}`;
+        for await (const entry of Deno.readDir(dataDir)) {
+          if (
+            entry.isFile &&
+            (entry.name.endsWith(".db-shm") || entry.name.endsWith(".db-wal"))
+          ) {
+            await Deno.remove(`${dataDir}/${entry.name}`);
+            console.info(
+              `启动自愈: 清除残留 WAL/SHM app_id=${app.id} file=${entry.name}`,
+            );
+            appHealed = true;
+          }
+        }
+      } catch {
+        // 数据目录不存在或不可读，跳过
+      }
+
+      // 2. 复位异常状态 → running（让懒恢复重新尝试）
+      const abnormal: AppStatus[] = ["error", "starting"];
+      if ((abnormal as string[]).includes(app.status)) {
+        await state.store.update({
+          ...app,
+          status: "running",
+          status_reason: undefined,
+        });
+        appHealed = true;
+      }
+
+      if (appHealed) healedCount++;
+    }
+
+    if (healedCount > 0) {
+      console.info(`启动自愈: 已修复 ${healedCount} 个 app`);
+      await state.store.flush();
+    }
+  } catch (e) {
+    console.warn(
+      `启动自愈失败（不影响服务启动） error=${(e as Error).message}`,
+    );
+  }
 
   // 注册信号监听做全局 cleanup（Drop SIGKILL 兜底的第 (b) 层）
   // Rust 端靠 trait Drop 自动触发；JS 端必须显式注册。

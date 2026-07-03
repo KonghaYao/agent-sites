@@ -29,7 +29,6 @@ import type { App } from "./app/model.ts";
 import { DEFAULT_MAX_BODY_BYTES, forward, isRecoverableError } from "./proxy/mod.ts";
 import { serveFileFromRoot } from "./static_files/mod.ts";
 import { AppError } from "./error.ts";
-import { PortAllocator } from "./process/port_allocator.ts";
 import type { RestartOutcome } from "./process/mod.ts";
 import type { AppState } from "./state.ts";
 import type { Ctx, Handler } from "./api/apps.ts";
@@ -392,8 +391,9 @@ async function serveApiProxy(
 
   // status=Error 直接短路
   if (app.status === "error") {
+    const reasonHint = app.status_reason ? `（${app.status_reason}）` : "";
     throw AppError.ServiceUnavailable(
-      `App ${appId} 后端处于 Error 状态，需重新创建`,
+      `App ${appId} 后端处于 Error 状态${reasonHint}，需重新创建`,
     );
   }
 
@@ -542,10 +542,9 @@ async function handleProxyWithRecovery(
   body: Uint8Array,
 ): Promise<Response> {
   const dataDir = `${state.dataDir}/${appId}`;
-  const allocator = new PortAllocator(state.portMin, state.portMax);
 
   const outcome: RestartOutcome = await state.processManager
-    .restartIfNeeded(appId, dataDir, allocator);
+    .restartIfNeeded(appId, dataDir, app.port);
 
   if (outcome === "Restarted" || outcome === "StillHealthy") {
     // restart 可能分配新端口（PM entry 缺失时），从 PM 读实时端口而非用 app.port
@@ -567,9 +566,13 @@ async function handleProxyWithRecovery(
   }
 
   // RateLimited | GiveUp：同步 status=Error + flush
+  const reason = outcome === "RateLimited"
+    ? "5分钟内重启超限（3次）"
+    : "重启失败：健康检查超时或端口冲突";
   const updated = {
     ...app,
     status: "error" as const,
+    status_reason: reason,
     updated_at: new Date().toISOString(),
   };
   await state.store.update(updated);
@@ -582,7 +585,7 @@ async function handleProxyWithRecovery(
     );
   }
   throw AppError.ServiceUnavailable(
-    `App ${appId} 后端多次重启失败，已停止自愈`,
+    `App ${appId} 后端多次重启失败，已停止自愈（${reason}）`,
   );
 }
 
@@ -622,12 +625,11 @@ async function serveCustomProxy(
 
     // enable_pb：确保 PB 进程存活后再启动 custom 进程
     if (app.enable_pb && app.pb_port && app.pb_port > 0) {
-      const pbAllocator = new PortAllocator(state.portMin, state.portMax);
       try {
         await state.processManager.restartIfNeeded(
           appId,
           `${state.dataDir}/${appId}`,
-          pbAllocator,
+          app.pb_port,
         );
       } catch (e) {
         console.warn(

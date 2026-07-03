@@ -57,6 +57,9 @@ export interface App {
   enable_pb?: boolean;
   /** custom 专用：PB 实例监听端口（127.0.0.1，仅 enable_pb=true 时有效）。 */
   pb_port?: number;
+  /** 状态变为 error 的原因（如 "健康检查超时"/"端口冲突"/"5min 重启超限"）。
+   *  仅 status==="error" 时有意义，其余状态为 undefined。持久化到 apps.json。 */
+  status_reason?: string;
 }
 
 /** app_id 后缀允许的字符：小写 ASCII 字母或数字（显式避免 `\w` Unicode 陷阱）。 */

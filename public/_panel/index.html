@@ -1005,7 +1005,9 @@
     document.body.classList.add("detail-open");
 
     if (!detailApp) {
-      renderDetailError("App not found in cached list");
+      console.warn("enterDetail: app not in cache", { appId, cachedIds: lastApps.map(a => a.id) });
+      renderDetailError(`App ${escapeHtml(appId)} not found — wait for load or refresh`);
+      await leaveDetail();
       return;
     }
     renderDetailHeader(detailApp);
@@ -1016,6 +1018,7 @@
     }
     if (!detailToken) {
       renderDetailError("Failed to acquire platform token — check Master Key");
+      await leaveDetail();
       return;
     }
 
@@ -1026,7 +1029,8 @@
     // fetch collections
     const cols = await fetchCollections(appId, detailToken.token);
     if (cols === null) {
-      renderDetailError("Failed to load collections — PB may be down");
+      renderDetailError("Failed to load collections — PB may be down or token invalid");
+      await leaveDetail();
       return;
     }
     detailCollections = cols;
@@ -1275,12 +1279,14 @@
   });
 
   // ---------- init ----------
-  updateMkBadge();
-  setLive(false);
-  tick();
-  // initialize detail view on page load (if hash present)
-  handleHash();
-  if (polling) startPolling();
+  (async () => {
+    updateMkBadge();
+    setLive(false);
+    await tick();
+    // initialize detail view on page load (if hash present)
+    handleHash();
+    if (polling) startPolling();
+  })();
 })();
 </script>
 </body>

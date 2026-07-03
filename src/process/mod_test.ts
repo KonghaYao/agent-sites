@@ -291,8 +291,10 @@ test("test_restart_if_needed_进程还活着_返回stillhealthy", async () => {
       const dataDir = `${tmp}/app-healthy`;
       await Deno.mkdir(dataDir, { recursive: true });
       await startWithSuperuser(pm, "app-healthy", dataDir, allocator);
+      const port = pm.getPort("app-healthy");
+      assertEquals(port !== undefined, true, "应获取到分配端口");
       // 进程还活着 → restartIfNeeded 应返回 StillHealthy，不重启
-      const outcome = await pm.restartIfNeeded("app-healthy", dataDir, allocator);
+      const outcome = await pm.restartIfNeeded("app-healthy", dataDir, port!);
       assertEquals(outcome, "StillHealthy", `应返回 StillHealthy，实际: ${outcome}`);
       // 验证没产生新进程（仍存活）
       assertEquals(pm.isAlive("app-healthy"), true);
@@ -321,8 +323,10 @@ test("test_restart_if_needed_进程死了_返回restarted", async () => {
       assertEquals(pid !== undefined, true, "应有子进程 PID");
       await externalKill(pid!);
       await delay(500);
+      const port = pm.getPort("app-dead");
+      assertEquals(port !== undefined, true, "应获取到分配端口");
       // restartIfNeeded 应重启
-      const outcome = await pm.restartIfNeeded("app-dead", dataDir, allocator);
+      const outcome = await pm.restartIfNeeded("app-dead", dataDir, port!);
       assertEquals(outcome, "Restarted", `应返回 Restarted，实际: ${outcome}`);
       assertEquals(pm.isAlive("app-dead"), true, "重启后应存活");
       await pm.stop("app-dead");
@@ -345,6 +349,8 @@ test("test_restart_if_needed_短窗口内超过3次_rate_limited", async () => {
       const dataDir = `${tmp}/app-ratelimit`;
       await Deno.mkdir(dataDir, { recursive: true });
       await startWithSuperuser(pm, "app-ratelimit", dataDir, allocator);
+      const rlPort = pm.getPort("app-ratelimit");
+      assertEquals(rlPort !== undefined, true, "应获取到分配端口");
       // 连续 kill+restart 3 次（每次都占满一个计数槽位）
       for (let i = 0; i < 3; i++) {
         const pid = pm.getPid("app-ratelimit");
@@ -354,7 +360,7 @@ test("test_restart_if_needed_短窗口内超过3次_rate_limited", async () => {
         const outcome = await pm.restartIfNeeded(
           "app-ratelimit",
           dataDir,
-          allocator,
+          rlPort!,
         );
         assertEquals(outcome, "Restarted", `第 ${i + 1} 次应 Restarted`);
       }
@@ -362,7 +368,7 @@ test("test_restart_if_needed_短窗口内超过3次_rate_limited", async () => {
       const outcome = await pm.restartIfNeeded(
         "app-ratelimit",
         dataDir,
-        allocator,
+        rlPort!,
       );
       assertEquals(outcome, "RateLimited", "第 4 次应 RateLimited");
       // 清理

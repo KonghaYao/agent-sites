@@ -81,6 +81,8 @@ export interface AppResponse {
   enable_pb?: boolean;
   /** custom + enable_pb 时返回 PB 实例端口。 */
   pb_port?: number;
+  /** App 处于 Error 状态时的具体原因。仅 status==="error" 时有值。 */
+  status_reason?: string;
 }
 
 /**
@@ -106,6 +108,9 @@ export function toAppResponse(a: App): AppResponse {
   if (a.type === "custom" && a.enable_pb) {
     resp.enable_pb = true;
     resp.pb_port = a.pb_port;
+  }
+  if (a.status === "error" && a.status_reason) {
+    resp.status_reason = a.status_reason;
   }
   return resp;
 }
