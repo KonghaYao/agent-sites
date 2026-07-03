@@ -618,7 +618,7 @@
   <table>
     <thead>
       <tr>
-        <th>ID</th>
+        <th style="width:140px">ID</th>
         <th>Name</th>
         <th>Status</th>
         <th>Port</th>
@@ -787,7 +787,7 @@
       const isError = a.status === "error";
       return `<tr class="${isError ? "err-row" : ""}">
         <td class="id-cell" data-copy="${escapeHtml(a.id)}">
-          ${escapeHtml(a.id)}
+          <a href="#${escapeHtml(a.id)}" style="color:inherit;text-decoration:none;display:block">${escapeHtml(a.id)}</a>
           <span class="copied">copied</span>
         </td>
         <td class="name-cell">${escapeHtml(a.name || "(unnamed)")}</td>
