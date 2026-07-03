@@ -834,6 +834,144 @@
     return `<span class="latency">—</span>`;
   }
 
+  // ---------- detail view rendering ----------
+  function renderDetailHeader(app) {
+    dHeaderEl.innerHTML = `
+      <button class="back" onclick="window.location.hash=''">← BACK</button>
+      <div>
+        <strong>${escapeHtml(app.name || app.id)}</strong>
+        <span style="color:var(--muted);margin-left:0.5em">(${escapeHtml(app.id)})</span>
+      </div>
+      <div class="info">
+        <span>type: <strong>${escapeHtml(app.type || "—")}</strong></span>
+        <span>port: <strong>${app.port || "—"}</strong></span>
+        <span id="d-pb-state">PB: …</span>
+      </div>`;
+  }
+
+  function updateDetailPbState(up) {
+    const el = document.getElementById("d-pb-state");
+    if (!el) return;
+    el.innerHTML = up
+      ? `<span class="up"><span class="dot"></span>PB: up</span>`
+      : `<span class="down"><span class="dot"></span>PB: down</span>`;
+  }
+
+  function renderCollectionsSidebar(collections) {
+    dSidebarEl.innerHTML = collections.map((c) => {
+      const active = detailActiveCol === c.id ? " active" : "";
+      const type = c.type || "base";
+      const fieldCount = Array.isArray(c.fields) ? c.fields.length : "—";
+      return `<button class="col-item${active}" data-col-id="${escapeHtml(c.id)}">
+        <span>${escapeHtml(c.name || c.id)}</span>
+        <span class="meta">${escapeHtml(type)} · ${fieldCount} fields</span>
+      </button>`;
+    }).join("");
+    if (collections.length === 0) {
+      dSidebarEl.innerHTML = `<div style="padding:1rem;color:var(--muted);font-size:11px">No collections</div>`;
+    }
+    dSidebarEl.querySelectorAll(".col-item").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const colId = btn.getAttribute("data-col-id");
+        selectCollection(colId);
+      });
+    });
+  }
+
+  function renderDetailTabs() {
+    dMainEl.innerHTML = `
+      <div class="tabs">
+        <button id="tab-schema" class="${detailActiveTab === "schema" ? "active" : ""}" onclick="window._panelSwitchTab('schema')">Schema</button>
+        <button id="tab-records" class="${detailActiveTab === "records" ? "active" : ""}" onclick="window._panelSwitchTab('records')">Records</button>
+      </div>
+      <div id="tab-content">Loading…</div>`;
+  }
+
+  function renderSchemaTab(schema) {
+    const fields = Array.isArray(schema.fields) ? schema.fields : [];
+    const rows = fields.map((f) => {
+      const req = f.required ? "✓" : "—";
+      const minmax = f.min != null || f.max != null ? `${f.min || 0}/${f.max || "∞"}` : "—";
+      return `<tr>
+        <td>${escapeHtml(f.name)}</td>
+        <td>${escapeHtml(f.type)}</td>
+        <td>${req}</td>
+        <td>${minmax}</td>
+        <td>${escapeHtml(String(f.required ?? "—"))}</td>
+      </tr>`;
+    }).join("");
+
+    const rules = [
+      { k: "listRule", v: schema.listRule },
+      { k: "viewRule", v: schema.viewRule },
+      { k: "createRule", v: schema.createRule },
+      { k: "updateRule", v: schema.updateRule },
+      { k: "deleteRule", v: schema.deleteRule },
+    ];
+    const rulesHtml = rules.map(({ k, v }) =>
+      `<div>${escapeHtml(k)}: <code>${v === "" ? "(allow all)" : v === null ? "(deny)" : escapeHtml(String(v))}</code></div>`
+    ).join("");
+
+    const tabContent = document.getElementById("tab-content");
+    if (!tabContent) return;
+    tabContent.innerHTML = `
+      <table class="schema-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Req</th><th>Min/Max</th><th>Rules</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" style="color:var(--muted)">No fields</td></tr>'}</tbody>
+      </table>
+      <div class="rules-block">
+        <b>Collection Rules</b>
+        ${rulesHtml}
+      </div>`;
+  }
+
+  function renderRecordsTab(result) {
+    const items = Array.isArray(result.items) ? result.items : [];
+    const page = result.page || 1;
+    const totalItems = result.totalItems || 0;
+    const totalPages = result.totalPages || 1;
+    const perPage = result.perPage || 20;
+
+    if (items.length === 0) {
+      const tabContent = document.getElementById("tab-content");
+      if (tabContent) tabContent.innerHTML = `<div style="color:var(--muted);padding:2rem;text-align:center">No records</div>`;
+      return;
+    }
+
+    const cards = items.map((rec) => {
+      const metaHtml = rec.created
+        ? `<div class="rec-meta">id: ${escapeHtml(rec.id)} · created: ${escapeHtml(rec.created)}${rec.updated ? " · updated: " + escapeHtml(rec.updated) : ""}</div>`
+        : "";
+      const fields = Object.entries(rec)
+        .filter(([k]) => !["id", "collectionId", "collectionName", "created", "updated"].includes(k))
+        .map(([k, v]) => {
+          let display = v === null ? "—" : typeof v === "object" ? JSON.stringify(v) : String(v);
+          if (display.length > 500) display = display.slice(0, 500) + "…";
+          return `<div class="rec-field"><span class="k">${escapeHtml(k)}</span><span class="v">${escapeHtml(display)}</span></div>`;
+        }).join("");
+      return `<div class="rec-card">${metaHtml}${fields}</div>`;
+    }).join("");
+
+    const prevDisabled = page <= 1 ? " disabled" : "";
+    const nextDisabled = page >= totalPages ? " disabled" : "";
+    const from = (page - 1) * perPage + 1;
+    const to = Math.min(page * perPage, totalItems);
+
+    const tabContent = document.getElementById("tab-content");
+    if (!tabContent) return;
+    tabContent.innerHTML = `
+      ${cards}
+      <div class="pager">
+        <button${prevDisabled} onclick="window._panelPageRecords(${page - 1})">◀ Prev</button>
+        <span>${from}–${to} of ${totalItems}</span>
+        <button${nextDisabled} onclick="window._panelPageRecords(${page + 1})">Next ▶</button>
+      </div>`;
+  }
+
+  function renderDetailError(msg) {
+    dMainEl.innerHTML = `<div style="padding:2rem;color:var(--err);font-family:var(--mono)">${escapeHtml(msg)}</div>`;
+  }
+
   function renderStats(apps, healthMap) {
     const total = apps.length;
     let alive = 0, err = 0;
