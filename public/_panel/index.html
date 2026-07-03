@@ -1179,6 +1179,7 @@
   }
 
   async function tick() {
+    if (detailAppId) return;
     if (inflight) return;
     inflight = true;
     try {
