@@ -882,6 +882,41 @@
     return Array.isArray(j.data) ? j.data : [];
   }
 
+  async function fetchCollections(appId, token) {
+    try {
+      const r = await fetch(
+        `/${encodeURIComponent(appId)}/api/collections`,
+        { headers: { "Authorization": "Bearer " + token }, cache: "no-store" },
+      );
+      if (!r.ok) return null;
+      const j = await r.json();
+      return Array.isArray(j.items) ? j.items : [];
+    } catch { return null; }
+  }
+
+  async function fetchCollectionSchema(appId, token, colId) {
+    try {
+      const r = await fetch(
+        `/${encodeURIComponent(appId)}/api/collections/${encodeURIComponent(colId)}`,
+        { headers: { "Authorization": "Bearer " + token }, cache: "no-store" },
+      );
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  }
+
+  async function fetchCollectionRecords(appId, token, colId, page, perPage) {
+    try {
+      const qs = `?page=${page}&perPage=${perPage}`;
+      const r = await fetch(
+        `/${encodeURIComponent(appId)}/api/collections/${encodeURIComponent(colId)}/records${qs}`,
+        { headers: { "Authorization": "Bearer " + token }, cache: "no-store" },
+      );
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  }
+
   async function fetchPbHealth(app) {
     const t0 = performance.now();
     try {
