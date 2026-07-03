@@ -664,6 +664,19 @@
   const baseUrlEl = $("base-url");
   const btnPoll = $("btn-poll");
   const btnRefresh = $("btn-refresh");
+
+  // detail view DOM refs
+  const detailEl = $("detail");
+  const dHeaderEl = $("d-header");
+  const dSidebarEl = $("d-sidebar");
+  const dMainEl = $("d-main");
+  let detailAppId = null;
+  let detailApp = null;
+  let detailToken = null; // { token, token_id }
+  let detailCollections = [];
+  let detailActiveCol = null; // 当前选中的 collection id
+  let detailActiveTab = "schema"; // "schema" | "records"
+  let detailRecordsPage = 1;
   const btnMkSave = $("btn-mk-save");
 
   let polling = true;
