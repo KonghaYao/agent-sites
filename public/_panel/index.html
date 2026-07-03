@@ -1255,6 +1255,19 @@
     else { stopPolling(); setLive(false); }
   });
 
+  // hash routing for detail view
+  function handleHash() {
+    const hash = location.hash.replace(/^#/, "");
+    if (hash) {
+      // entered detail view
+      enterDetail(hash);
+    } else if (detailAppId) {
+      // returned from detail view
+      leaveDetail();
+    }
+  }
+  window.addEventListener("hashchange", handleHash);
+
   // pause polling when tab hidden, resume when visible
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) stopPolling();
