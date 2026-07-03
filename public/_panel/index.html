@@ -987,6 +987,114 @@
     $("s-err").textContent = err;
   }
 
+  // ---------- detail view lifecycle ----------
+  async function enterDetail(appId) {
+    if (detailAppId === appId && detailToken) return; // already open
+
+    // pause global polling
+    stopPolling();
+    setLive(false);
+
+    detailAppId = appId;
+    detailApp = lastApps.find((a) => a.id === appId) || null;
+    detailCollections = [];
+    detailActiveCol = null;
+    detailActiveTab = "schema";
+    detailRecordsPage = 1;
+
+    document.body.classList.add("detail-open");
+
+    if (!detailApp) {
+      renderDetailError("App not found in cached list");
+      return;
+    }
+    renderDetailHeader(detailApp);
+
+    // acquire token
+    if (!detailToken) {
+      detailToken = await acquireToken(appId);
+    }
+    if (!detailToken) {
+      renderDetailError("Failed to acquire platform token — check Master Key");
+      return;
+    }
+
+    // check PB health
+    const h = await fetchPbHealth(detailApp);
+    updateDetailPbState(h.state === "up");
+
+    // fetch collections
+    const cols = await fetchCollections(appId, detailToken.token);
+    if (cols === null) {
+      renderDetailError("Failed to load collections — PB may be down");
+      return;
+    }
+    detailCollections = cols;
+    renderCollectionsSidebar(cols);
+    dMainEl.innerHTML = `<div style="padding:2rem;color:var(--muted)">Select a collection from the sidebar</div>`;
+  }
+
+  async function leaveDetail() {
+    await releaseToken();
+    detailAppId = null;
+    detailApp = null;
+    detailCollections = [];
+    detailActiveCol = null;
+    detailToken = null;
+    document.body.classList.remove("detail-open");
+    // resume polling
+    tick();
+    if (polling) startPolling();
+  }
+
+  async function selectCollection(colId) {
+    if (!detailToken || !detailAppId) return;
+    detailActiveCol = colId;
+    detailActiveTab = "schema";
+    detailRecordsPage = 1;
+    renderCollectionsSidebar(detailCollections);
+    renderDetailTabs();
+
+    // fetch schema
+    const schema = await fetchCollectionSchema(detailAppId, detailToken.token, colId);
+    if (!schema) {
+      renderDetailError("Failed to load collection schema");
+      return;
+    }
+    renderSchemaTab(schema);
+  }
+
+  async function switchTab(tab) {
+    detailActiveTab = tab;
+    const tabSchema = document.getElementById("tab-schema");
+    const tabRecords = document.getElementById("tab-records");
+    if (tabSchema) tabSchema.classList.toggle("active", tab === "schema");
+    if (tabRecords) tabRecords.classList.toggle("active", tab === "records");
+
+    if (!detailToken || !detailAppId || !detailActiveCol) return;
+    if (tab === "schema") {
+      const schema = await fetchCollectionSchema(detailAppId, detailToken.token, detailActiveCol);
+      if (schema) renderSchemaTab(schema);
+      else renderDetailError("Failed to load schema");
+    } else {
+      const result = await fetchCollectionRecords(detailAppId, detailToken.token, detailActiveCol, detailRecordsPage, 20);
+      if (result) renderRecordsTab(result);
+      else renderDetailError("Failed to load records");
+    }
+  }
+
+  async function pageRecords(page) {
+    detailRecordsPage = page;
+    if (!detailToken || !detailAppId || !detailActiveCol) return;
+    const result = await fetchCollectionRecords(detailAppId, detailToken.token, detailActiveCol, page, 20);
+    if (result) renderRecordsTab(result);
+    else renderDetailError("Failed to load records");
+  }
+
+  // expose for onclick handlers in HTML fragments
+  window._panelSwitchTab = switchTab;
+  window._panelPageRecords = pageRecords;
+
   function setLive(on) {
     liveDot.classList.toggle("paused", !on);
     liveText.textContent = on ? "LIVE" : "PAUSED";
