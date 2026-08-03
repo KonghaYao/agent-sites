@@ -9,7 +9,7 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@^1";
 import { initSuperuser, pbBinaryAvailable, pbBinaryPath, withTestSpawnLock } from "./pocketbase.ts";
 import { PortAllocator } from "./port_allocator.ts";
-import { PocketBaseProcessManager, RestartCounter } from "./mod.ts";
+import { ManagedProcess, PocketBaseProcessManager, RestartCounter } from "./mod.ts";
 
 // 测试 helper：spawn pb 前预置 superuser，避免 /_/ Admin UI 暴露「创建第一个
 // superuser」抢注页面。所有测试 pm.start() 必须走这个 helper——直接 pm.start()
@@ -657,6 +657,175 @@ test("test_restart_if_needed_端口被外部进程占用_换端口重启成功",
     } finally {
       await Deno.remove(tmp, { recursive: true });
       await server.shutdown();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R4：占位对象安全（delete 与 restart 并发不再抛 TypeError / 制造孤儿进程）
+// ---------------------------------------------------------------------------
+
+test("test_pm_stop_占位对象_不抛错", () => {
+  // restartIfNeeded 期间 map 里是占位对象（无真实子进程）。并发 stop
+  // （如 deleteApp → pm.stop）此前会因占位对象没有 startKill 抛 TypeError
+  // → deleteApp 500 + restart 继续 spawn 孤儿进程（R4）。
+  const pm = new PocketBaseProcessManager(pbBinaryPath());
+  // 直接构造占位对象塞入 map，模拟 restartIfNeeded 换端口/等待期
+  pm.processes.set("app-placeholder", {
+    port: 23850,
+    isAlive: () => false,
+    startKill: () => {},
+    statusPromise: Promise.resolve({ code: 0, signal: null, success: true }),
+    exitHandler: Promise.resolve(),
+  } as unknown as ManagedProcess);
+  // Act: stop 占位对象不应抛错
+  pm.stop("app-placeholder");
+  // Assert: map 中占位被清除
+  assertEquals(pm.isRunning("app-placeholder"), false, "stop 后占位应从 map 移除");
+});
+
+// ---------------------------------------------------------------------------
+// 端口冲突换端口：段耗尽 GiveUp / used 语义（审计补缺）
+// ---------------------------------------------------------------------------
+
+test("test_restart_if_needed_端口被外部占用_无可用换端口_GiveUp记录原因", async () => {
+  const port = 23810;
+  // mock server 占用端口（外部进程），allocator 只允许这一个端口 → 无端口可换
+  let onReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    onReady = resolve;
+  });
+  const server = Deno.serve(
+    {
+      hostname: "127.0.0.1",
+      port,
+      onListen: () => onReady(),
+    },
+    () => new Response("ok", { status: 200 }),
+  );
+  await ready;
+  try {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const pm = new PocketBaseProcessManager(pbBinaryPath());
+      const dataDir = `${tmp}/app-giveup`;
+      await Deno.mkdir(dataDir, { recursive: true });
+      const allocator = new PortAllocator(port, port);
+      // Act: 端口被外部进程占用 + 无可用换端口 → GiveUp 而非无限重试
+      const result = await pm.restartIfNeeded(
+        "app-giveup",
+        dataDir,
+        port,
+        { allocator, used: new Set([port]) },
+      );
+      // Assert: GiveUp + 不残留进程 + 具体原因被记录（供 API 层透传）
+      assertEquals(result.outcome, "GiveUp", "无可用换端口应 GiveUp");
+      assertEquals(pm.isRunning("app-giveup"), false, "GiveUp 后不应有进程");
+      assertEquals(
+        pm.lastRestartFailure.get("app-giveup")?.includes("无可用换端口"),
+        true,
+        `应记录无可用换端口原因，实际: ${pm.lastRestartFailure.get("app-giveup")}`,
+      );
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  } finally {
+    await server.shutdown();
+  }
+});
+
+test("test_restart_if_needed_端口被外部占用_used含其他app端口_换到更后端口", async () => {
+  if (!pbBinaryAvailable()) {
+    console.warn("跳过：pocketbase 二进制不可用");
+    return;
+  }
+  await withTestSpawnLock(async () => {
+    const busyPort = 23800;
+    const otherAppPort = 23801; // 模拟另一 app 已持久化的端口（不可用）
+    const freePort = 23802;
+    // mock server 占用 busyPort，模拟外部进程
+    let onReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      onReady = resolve;
+    });
+    const server = Deno.serve(
+      {
+        hostname: "127.0.0.1",
+        port: busyPort,
+        onListen: () => onReady(),
+      },
+      () => new Response("ok", { status: 200 }),
+    );
+    await ready;
+    try {
+      const tmp = await Deno.makeTempDir();
+      try {
+        const pm = new PocketBaseProcessManager(pbBinaryPath());
+        const dataDir = `${tmp}/app-rehome2`;
+        await Deno.mkdir(dataDir, { recursive: true });
+        initSuperuser(
+          pm.binary,
+          dataDir,
+          "app-rehome2@test.local",
+          "test-superuser-password-12345",
+        );
+        // used 模拟 apps.json：{busyPort 旧端口, otherAppPort 另一 app 的端口}
+        const used = new Set([busyPort, otherAppPort]);
+        const allocator = new PortAllocator(busyPort, freePort);
+        // Act: 端口被外部进程占用 → 换端口，且必须跳过 used 中其他 app 的端口
+        const result = await pm.restartIfNeeded(
+          "app-rehome2",
+          dataDir,
+          busyPort,
+          { allocator, used },
+        );
+        // Assert: 换到 23802（跳过 23801 另一 app 端口）
+        assertEquals(result.outcome, "Restarted", `应换端口重启，实际: ${result.outcome}`);
+        assertEquals(result.port, freePort, "应换到 used 之外的端口 23802");
+        assertEquals(pm.getPort("app-rehome2"), freePort, "PM 端口应更新");
+        assertEquals(pm.isAlive("app-rehome2"), true, "换端口后进程应存活");
+        await pm.stop("app-rehome2");
+      } finally {
+        await Deno.remove(tmp, { recursive: true });
+      }
+    } finally {
+      await server.shutdown();
+    }
+  });
+});
+
+test("test_pm_start_并发两个app_分配端口互不相同", async () => {
+  if (!pbBinaryAvailable()) {
+    console.warn("跳过：pocketbase 二进制不可用");
+    return;
+  }
+  await withTestSpawnLock(async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const pm = new PocketBaseProcessManager(pbBinaryPath());
+      const allocator = new PortAllocator(23820, 23839);
+      // 两个 app 并发 start（原子段语义：检查+分配+spawn+insert 无 await 让出）
+      const dirs = [`${tmp}/app-c1`, `${tmp}/app-c2`];
+      for (const d of dirs) {
+        await Deno.mkdir(d, { recursive: true });
+        initSuperuser(
+          pm.binary,
+          d,
+          `${d.split("/").pop()}@test.local`,
+          "test-superuser-password-12345",
+        );
+      }
+      // Act: Promise.all 并发启动
+      const ports = await Promise.all([
+        pm.start("app-c1", dirs[0], "/app-c1/", allocator),
+        pm.start("app-c2", dirs[1], "/app-c2/", allocator),
+      ]);
+      // Assert: 端口互异（同端口分配是线上同端口 running 记录的根源）
+      assertEquals(ports[0] !== ports[1], true, `并发 start 端口必须互异: ${ports}`);
+      await pm.stop("app-c1");
+      await pm.stop("app-c2");
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
     }
   });
 });

@@ -40,6 +40,22 @@ function customEnvWhitelist(): Record<string, string> {
 export class CustomProcessManager {
   /** app_id → ManagedProcess */
   readonly processes: Map<string, ManagedProcess> = new Map();
+  /**
+   * 端口分配声明集合：deploy 分配新端口后立即声明占用，防止并发 deploy
+   * 读到同一份 usedPorts 快照分到同一端口（R5）。进程启动成功（端口已被
+   * 真实绑定）或失败（端口未被占用）后由 deploy 释放。
+   */
+  readonly reservedPorts: Set<number> = new Set();
+
+  /** 声明占用端口（deploy 分配后同步调用，防并发 deploy 撞端口）。 */
+  reservePort(port: number): void {
+    this.reservedPorts.add(port);
+  }
+
+  /** 释放端口声明（进程启动完成或失败时调用）。 */
+  releasePort(port: number): void {
+    this.reservedPorts.delete(port);
+  }
 
   /**
    * 启动自定义应用子进程。
@@ -116,27 +132,38 @@ export class CustomProcessManager {
   /**
    * 异步启动 + TCP 探活（轮询端口直到可连接，超时 10s）。
    * 成功返回 ManagedProcess，失败停止进程并 throw。
+   *
+   * R2：双槽位切换时旧进程在 start() 内已被 SIGTERM；健康检查通过后
+   * 按「引用」回收旧进程（等退出 + SIGKILL 兜底），而不是让调用方
+   * stop(id)——map 已被替换为新进程，stop(id) 会误杀新进程。
+   * R3：探活带 isAlive 确认，进程已退出（bind 失败/崩溃）时立即失败，
+   * 不误连端口上其他进程的假健康。
    */
   async startAndWait(
     params: CustomAppStartParams,
     timeoutSecs = 10,
   ): Promise<ManagedProcess> {
+    const existing = this.processes.get(params.appId);
     const proc = this.start(params);
-    const healthy = await tcpHealthCheck(params.port, timeoutSecs);
+    const healthy = await tcpHealthCheck(params.port, timeoutSecs, () => proc.isAlive());
     if (!healthy) {
       await this.stop(params.appId);
       throw new Error(
         `自定义应用健康检查失败 app_id=${params.appId} port=${params.port}`,
       );
     }
+    // 健康检查通过：回收旧进程（start() 已对其发 SIGTERM，这里等退出 + 强杀兜底）
+    if (existing && existing !== proc) {
+      await this.stopProcess(existing);
+    }
     return proc;
   }
 
-  /** 停止并清理。 */
-  async stop(appId: string): Promise<void> {
-    const proc = this.processes.get(appId);
-    if (!proc) return;
-    this.processes.delete(appId);
+  /**
+   * 按引用停止指定进程（不查 map）。
+   * 用于回收已被新进程替换的旧进程（双槽位切换），避免 stop(id) 误杀新进程。
+   */
+  async stopProcess(proc: ManagedProcess): Promise<void> {
     proc.startKill();
     try {
       await raceWithTimeout(proc.statusPromise, 5_000);
@@ -151,6 +178,14 @@ export class CustomProcessManager {
     try {
       await proc.exitHandler;
     } catch { /* ignore */ }
+  }
+
+  /** 停止并清理。 */
+  async stop(appId: string): Promise<void> {
+    const proc = this.processes.get(appId);
+    if (!proc) return;
+    this.processes.delete(appId);
+    await this.stopProcess(proc);
   }
 
   /** 进程是否存活。 */
@@ -175,13 +210,23 @@ export class CustomProcessManager {
   }
 }
 
-/** TCP 端口探活：轮询 localhost:port，每次 200ms 间隔。 */
+/**
+ * TCP 端口探活：轮询 localhost:port，每次 200ms 间隔。
+ *
+ * R3：isAlive 回调（可选）——进程已退出时立即失败，且连接成功后再确认
+ * 进程仍活着：若已退出，说明连上的是端口上其他进程（假健康），必须判失败。
+ * 此前纯 TCP connect 连上即判 healthy，外部进程/PB 抢端口时 custom 进程
+ * bind 失败退出后仍被记 running，代理把请求打到错误的进程。
+ */
 async function tcpHealthCheck(
   port: number,
   timeoutSecs: number,
+  isAlive?: () => boolean,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutSecs * 1000;
   while (Date.now() < deadline) {
+    // 进程已退出（如 bind 失败）：立即失败，不白等也不误连其他实例
+    if (isAlive && !isAlive()) return false;
     try {
       const conn = await Deno.connect({
         hostname: "127.0.0.1",
@@ -189,6 +234,8 @@ async function tcpHealthCheck(
         transport: "tcp",
       });
       conn.close();
+      // 连接成功后再确认进程活着：若已退出，200 来自端口上的其他实例
+      if (isAlive && !isAlive()) return false;
       return true;
     } catch {
       await new Promise((r) => setTimeout(r, 200));

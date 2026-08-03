@@ -243,6 +243,14 @@ Deno.serve({ hostname: "127.0.0.1", port }, () => {
     // 等待切换 + 旧进程停止
     await delay(500);
 
+    // R2 回归：重部署后新进程必须存活。修复前 deploy step 10 调
+    // customProcessManager.stop(id) 时 map 已被替换为新进程 → 误杀新进程
+    // （旧进程仅靠非阻塞 SIGTERM 回收），此处断言会失败。
+    assert(
+      state.customProcessManager.isAlive(appId),
+      "重部署后新进程应存活（不被 stop(id) 误杀）",
+    );
+
     // 验证新版本
     const v2Resp = await handler(
       new Request(
@@ -290,6 +298,84 @@ Deno.serve({ hostname: "127.0.0.1", port }, () => {
     assertEquals(goneResp.status, 404, "删除后 GET /{appId}/ 应返回 404");
   } finally {
     // 清理所有 custom 进程
+    for (const [id] of state.customProcessManager.processes) {
+      await state.customProcessManager.stop(id).catch(() => {});
+    }
+    await Deno.remove(tmpDir, { recursive: true }).catch(() => {});
+  }
+});
+
+// R3 回归：deploy 分配的端口被外部进程占用（未记录在 apps.json 中）时，
+// 必须 probe 拒绝部署（409），而不是 spawn 后 bind 失败 + tcpHealthCheck
+// 连上外部进程判假健康（审计发现 custom 链路缺失端口探测）。
+Deno.test({
+  name: "test_custom_app_deploy_端口被外部进程占用_409拒绝",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  sanitizeExit: false,
+}, async () => {
+  const tmpDir = await Deno.makeTempDir();
+  const state = await makeState(tmpDir);
+  const handler = createApp(state);
+
+  // mock server 占用端口段最小值 25000——deploy 的分配器会从它开始扫，
+  // 若不 probe 就会选到它（它不在 apps.json 的 usedPorts 里）
+  let onReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    onReady = resolve;
+  });
+  const server = Deno.serve(
+    {
+      hostname: "127.0.0.1",
+      port: 25000,
+      onListen: () => onReady(),
+    },
+    () => new Response("mock", { status: 200 }),
+  );
+  await ready;
+  try {
+    const createResp = await handler(
+      new Request("http://localhost/api/apps", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-master-key": TEST_MASTER_KEY,
+        },
+        body: JSON.stringify({ name: "test-probe", type: "custom" }),
+      }),
+    );
+    assertEquals(createResp.status, 200);
+    const appId: string = (await createResp.json()).data.id;
+
+    const serverCode = `
+const port = parseInt(Deno.env.get("PORT") || "8080");
+Deno.serve({ hostname: "127.0.0.1", port }, () => new Response("ok"));
+`;
+    const gzipBundle = await makeTestGzipBundle({ "main.ts": serverCode });
+    const deployResp = await handler(
+      new Request(
+        `http://localhost/api/apps/${appId}/deploy`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/gzip",
+            "x-master-key": TEST_MASTER_KEY,
+          },
+          body: gzipBundle.slice().buffer,
+        },
+      ),
+    );
+    // Act: 分配器选中被外部进程占用的端口 → 必须 409 拒绝而非假健康成功
+    assertEquals(deployResp.status, 409, "端口被外部进程占用应 409");
+    const deployJson = await deployResp.json();
+    assert(
+      deployJson.error?.message?.includes("被占用"),
+      `错误消息应说明端口被占用，实际: ${JSON.stringify(deployJson.error)}`,
+    );
+    // 拒绝后不应残留进程
+    assertEquals(state.customProcessManager.isAlive(appId), false, "不应残留进程");
+  } finally {
+    await server.shutdown();
     for (const [id] of state.customProcessManager.processes) {
       await state.customProcessManager.stop(id).catch(() => {});
     }

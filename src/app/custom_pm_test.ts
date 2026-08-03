@@ -2,7 +2,7 @@
 // 测试策略：创建一个最简单的 HTTP 服务 main.ts，验证 CustomPM 的 start/stop/isAlive 全链路。
 // 使用 sanitizeOps: false, sanitizeResources: false, sanitizeExit: false（子进程残留 timer 必需）。
 
-import { assert, assertEquals, assertFalse } from "jsr:@std/assert@1";
+import { assert, assertEquals, assertFalse, assertRejects } from "jsr:@std/assert@1";
 import { CustomProcessManager } from "./custom_pm.ts";
 
 const MINI_SERVER_TS = `
@@ -83,6 +83,40 @@ Deno.test("test_custom_pm_replace_stale_process", {
     assertFalse(proc1.isAlive());
   } finally {
     await pm.stop("app-test0002").catch(() => {});
+    await Deno.remove(tmpDir, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test("test_custom_pm_start_进程立即退出_健康检查快速失败", {
+  sanitizeOps: false,
+  sanitizeResources: false,
+  sanitizeExit: false,
+}, async () => {
+  const tmpDir = await Deno.makeTempDir();
+  try {
+    const entryPath = `${tmpDir}/main.ts`;
+    // 入口立即退出：模拟 custom 进程 spawn 后崩溃（bind 失败/代码崩）。
+    // R3：tcpHealthCheck 带 isAlive 回调，进程已退出时立即失败，
+    // 不白等满 timeoutSecs，也不误连端口上其他进程的假健康。
+    await Deno.writeTextFile(entryPath, `Deno.exit(0);\n`);
+    const pm = new CustomProcessManager();
+    const port = 19995; // 无监听
+    // Act: 进程立即退出 → startAndWait 必须失败
+    await assertRejects(
+      () =>
+        pm.startAndWait({
+          appId: "app-fakehealth",
+          port,
+          codeDir: tmpDir,
+          runtimeDir: tmpDir,
+          entryFile: "main.ts",
+        }, 10),
+      Error,
+      "健康检查失败",
+    );
+    // Assert: 失败后不残留进程记录
+    assertFalse(pm.isAlive("app-fakehealth"), "健康检查失败后不应残留进程");
+  } finally {
     await Deno.remove(tmpDir, { recursive: true }).catch(() => {});
   }
 });

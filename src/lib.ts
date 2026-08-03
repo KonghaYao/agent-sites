@@ -545,9 +545,11 @@ async function handleProxyWithRecovery(
   const dataDir = `${state.dataDir}/${appId}`;
 
   // fallback：端口被外部进程占用（用户服务与 PB 端口段重叠）时换端口重启。
-  // used 合并持久化端口 + PM 内存端口，避免换端口分到其他 app 的端口。
+  // used 合并持久化端口 + PM 内存端口 + 并发 deploy 的端口声明（R5），
+  // 避免换端口分到其他 app 的端口或正在部署中的新端口。
   const usedPorts = await state.store.usedPorts();
   for (const p of state.processManager.processes.values()) usedPorts.add(p.port);
+  for (const p of state.customProcessManager.reservedPorts) usedPorts.add(p);
   const allocator = new PortAllocator(state.portMin, state.portMax);
   const result: RestartResult = await state.processManager
     .restartIfNeeded(appId, dataDir, app.port, { allocator, used: usedPorts });
@@ -632,7 +634,10 @@ async function serveCustomProxy(
   } => {
     if (app.enable_pb && app.pb_port && app.pb_port > 0) {
       return {
-        pbUrl: `http://127.0.0.1:${app.pb_port}`,
+        // 用 localhost 而非 127.0.0.1：与健康检查/forward 的 localhost 一致，
+        // 兼容 PB 在不同平台解析 localhost 绑定的地址族（实测 0.23.10 macOS
+        // 绑 127.0.0.1，但 Go 解析顺序可能变化，硬编码某族有断连风险）
+        pbUrl: `http://localhost:${app.pb_port}`,
         pbSuperuserEmail: app.superuser_email,
         pbSuperuserPassword: app.superuser_password,
       };
@@ -650,10 +655,15 @@ async function serveCustomProxy(
     // enable_pb：确保 PB 进程存活后再启动 custom 进程
     if (app.enable_pb && app.pb_port && app.pb_port > 0) {
       try {
-        // 端口冲突时允许换端口；换端口后更新 app.pb_port 持久化
+        // 端口冲突时允许换端口；换端口后更新 app.pb_port 持久化。
+        // used 合并并发 deploy 的端口声明（R5）：换端口绝不能选正在部署
+        // 的新端口（此刻无人监听，probe 挡不住）。
         const usedPorts = await state.store.usedPorts();
         for (const p of state.processManager.processes.values()) {
           usedPorts.add(p.port);
+        }
+        for (const p of state.customProcessManager.reservedPorts) {
+          usedPorts.add(p);
         }
         const allocator = new PortAllocator(state.portMin, state.portMax);
         const result = await state.processManager.restartIfNeeded(

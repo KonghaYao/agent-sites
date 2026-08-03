@@ -3,6 +3,7 @@ import type { Ctx } from "./apps.ts";
 import { AppError } from "../error.ts";
 import { UntarStream } from "jsr:@std/tar@^0.1.10/untar-stream";
 import { PortAllocator } from "../process/port_allocator.ts";
+import { probePortFree } from "../process/pocketbase.ts";
 
 const MAX_DEPLOY_COMPRESSED = 20 * 1024 * 1024;
 const MAX_DEPLOY_DECOMPRESSED = 100 * 1024 * 1024;
@@ -231,10 +232,23 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
   }
 
   // 7. 分配新端口
+  // used 合并：apps.json 持久化端口（含 custom port + pb_port）+
+  // 并发 deploy 的端口声明（reservedPorts）。usedPorts 是快照，两个并发
+  // deploy 若都读到旧状态会分到同一端口（R5），reserve 声明是同步的，
+  // 在 allocate 与 spawn 之间挡住后来的分配。
   const usedPorts = await state.store.usedPorts();
+  for (const p of state.customProcessManager.reservedPorts) usedPorts.add(p);
   const allocator = new PortAllocator(state.portMin, state.portMax);
   const newPort = allocator.allocate(usedPorts);
   if (newPort === 0) throw AppError.Internal("端口范围耗尽");
+  // 分配后探测端口可绑定性（R3）：used 快照不含「未记录但真实占用」的端口
+  // （外部进程/泄漏的孤儿），spawn 后 bind 失败 + tcpHealthCheck 会连到其他
+  // 进程的假健康。probe 失败直接拒绝本次部署。
+  if (!probePortFree(newPort)) {
+    throw AppError.Conflict(`端口 ${newPort} 被占用，请稍后重试部署`);
+  }
+  // 同步声明端口占用（防并发 deploy 分到同一端口），成功/失败路径均需释放
+  state.customProcessManager.reservePort(newPort);
 
   // 7b. 如果 enable_pb，确保 PB 进程存活
   let pbUrl: string | undefined;
@@ -244,11 +258,18 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
   let pbPortAfterRestart: number | undefined;
   if (app.enable_pb && app.pb_port && app.pb_port > 0) {
     try {
-      // 端口被外部进程占用时允许换端口重启，返回新端口供 pbUrl 与持久化
+      // 端口被外部进程占用时允许换端口重启，返回新端口供 pbUrl 与持久化。
+      // 关键（R1）：pbUsed 必须并入 newPort——allocateProbedPort 从端口段
+      // 下限向上扫，若不含 newPort，PB 换端口时第一个可绑定端口就是 newPort
+      // （最小空闲、未持久化、此刻无人监听）→ PB 抢走 custom 的新端口 →
+      // custom bind 失败 + 假健康。reservedPorts 同理（其他并发 deploy 的
+      // 新端口此刻也无人监听，probe 挡不住）。
       const pbUsed = new Set(usedPorts);
       for (const p of state.processManager.processes.values()) {
         pbUsed.add(p.port);
       }
+      pbUsed.add(newPort);
+      for (const p of state.customProcessManager.reservedPorts) pbUsed.add(p);
       const pbAllocator = new PortAllocator(state.portMin, state.portMax);
       const pbResult = await state.processManager.restartIfNeeded(
         id,
@@ -266,7 +287,7 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
           `PB 重启失败: ${state.processManager.lastRestartFailure.get(id) ?? pbResult.outcome}`,
         );
       }
-      pbUrl = `http://127.0.0.1:${actualPbPort ?? app.pb_port}`;
+      pbUrl = `http://localhost:${actualPbPort ?? app.pb_port}`;
       pbSuperuserEmail = app.superuser_email;
       pbSuperuserPassword = app.superuser_password;
     } catch (e) {
@@ -278,17 +299,22 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
   }
 
   // 8. 启动新进程 + 探活
-  const oldPort = app.port;
-  await state.customProcessManager.startAndWait({
-    appId: id,
-    port: newPort,
-    codeDir: deployDir,
-    runtimeDir,
-    entryFile,
-    pbUrl,
-    pbSuperuserEmail,
-    pbSuperuserPassword,
-  }, 10);
+  try {
+    await state.customProcessManager.startAndWait({
+      appId: id,
+      port: newPort,
+      codeDir: deployDir,
+      runtimeDir,
+      entryFile,
+      pbUrl,
+      pbSuperuserEmail,
+      pbSuperuserPassword,
+    }, 10);
+  } catch (e) {
+    // 启动失败：释放端口声明，让后续部署可复用
+    state.customProcessManager.releasePort(newPort);
+    throw e;
+  }
 
   // 9. 原子切换
   const updated = {
@@ -302,11 +328,11 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
   };
   await state.store.update(updated);
   await state.store.flush();
-
-  // 10. 停旧进程
-  if (oldPort > 0 && oldPort !== newPort) {
-    await state.customProcessManager.stop(id).catch(() => {});
-  }
+  // 新进程已接管（端口真实绑定），释放端口声明
+  state.customProcessManager.releasePort(newPort);
+  // 注：旧进程的回收由 startAndWait 按引用完成（R2）。这里不能再调
+  // customProcessManager.stop(id)——map 已被替换为新进程，stop(id) 会
+  // 误杀刚部署好的新进程。
 
   return Response.json({
     data: {

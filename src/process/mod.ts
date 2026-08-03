@@ -497,7 +497,12 @@ export class PocketBaseProcessManager {
       // 已退出 → 清理
       this.processes.delete(appId);
     }
-    this.processes.set(appId, { port } as ManagedProcess);
+    // 占位对象（非裸 {port}）：占位期可能被并发 stop/delete 命中（deleteApp →
+    // pm.stop 会删 map），裸对象没有 startKill/statusPromise 方法会抛 TypeError
+    // → deleteApp 500 + restart 继续 spawn 制造孤儿进程（R4）。占位对象对
+    // stop()/isAlive() 等操作安全，且被 stop 移除后 restart 能检测到并放弃 spawn。
+    let placeholder = placeholderFor(port);
+    this.processes.set(appId, placeholder);
     const requestedPort = port;
 
     // === 3. 端口冲突处理 ===
@@ -516,7 +521,8 @@ export class PocketBaseProcessManager {
             `端口 ${port} 被非 pocketbase 进程占用，换端口 ${newPort} 重启 app_id=${appId}`,
           );
           // 更新占位端口（同步段，防并发重启请求分到旧端口）
-          this.processes.set(appId, { port: newPort } as ManagedProcess);
+          placeholder = placeholderFor(newPort);
+          this.processes.set(appId, placeholder);
           port = newPort;
         } else {
           this.processes.delete(appId); // 释放占位
@@ -556,6 +562,16 @@ export class PocketBaseProcessManager {
       console.error(
         `数据目录不存在，GiveUp app_id=${appId} dataDir=${dataDir}`,
       );
+      return { outcome: "GiveUp" as RestartOutcome };
+    }
+
+    // === 3.5 并发 stop 检查（在最后一个 await 之后、spawn 之前）===
+    // 占位期若有并发 stop/delete（deleteApp → pm.stop），stop 已把占位从 map
+    // 移除。此刻若仍继续 spawn，新进程将无人管理 → 孤儿进程占端口（R4，
+    // 压测发现的 9298 孤儿即此类）。检查 + spawn + insert 在同一同步段内
+    // （无 await），原子无 TOCTOU。
+    if (this.processes.get(appId) !== placeholder) {
+      console.warn(`重启期间进程被并发停止，放弃重启 app_id=${appId}`);
       return { outcome: "GiveUp" as RestartOutcome };
     }
 
@@ -739,6 +755,33 @@ function allocateProbedPort(allocator: PortAllocator, used: Set<number>): number
     return p;
   }
   return 0;
+}
+
+/**
+ * 创建 restartIfNeeded 期间的占位进程对象（无真实子进程）。
+ *
+ * 只用于占住端口（防并发重启请求通过 processes.values() 分到同端口）。
+ * 对 PM 的 stop()/isAlive()/getPort() 等操作必须安全：
+ * - startKill：no-op（无子进程可杀）
+ * - isAlive()：false（重启进行中视为不存活）
+ * - statusPromise/exitHandler：已 resolve（stop 的 race 立即通过）
+ *
+ * R4：此前用裸 `{port} as ManagedProcess`，并发 delete/restart 时 stop()
+ * 调 proc.startKill() 抛 TypeError → deleteApp 500 + restart 继续 spawn
+ * 孤儿进程。占位对象补齐最小接口后该路径不再抛错；spawn 前另有
+ * 「占位是否还在 map」检查兜底放弃 spawn（见 restartIfNeeded 3.5 节）。
+ */
+function placeholderFor(port: number): ManagedProcess {
+  const settled: Deno.CommandStatus = { code: 0, signal: null, success: true };
+  return {
+    port,
+    isAlive: () => false,
+    startKill: () => {},
+    statusPromise: Promise.resolve(settled),
+    exitHandler: Promise.resolve(),
+    tryWait: () => ({ code: 0 }),
+    getPid: () => undefined,
+  } as unknown as ManagedProcess;
 }
 
 /** Promise 化的 setTimeout */
