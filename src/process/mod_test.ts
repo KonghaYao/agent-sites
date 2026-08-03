@@ -306,8 +306,9 @@ test("test_restart_if_needed_进程还活着_返回stillhealthy", async () => {
       const port = pm.getPort("app-healthy");
       assertEquals(port !== undefined, true, "应获取到分配端口");
       // 进程还活着 → restartIfNeeded 应返回 StillHealthy，不重启
-      const outcome = await pm.restartIfNeeded("app-healthy", dataDir, port!);
-      assertEquals(outcome, "StillHealthy", `应返回 StillHealthy，实际: ${outcome}`);
+      const result = await pm.restartIfNeeded("app-healthy", dataDir, port!);
+      assertEquals(result.outcome, "StillHealthy", `应返回 StillHealthy，实际: ${result.outcome}`);
+      assertEquals(result.port, undefined, "未重启不应携带新端口");
       // 验证没产生新进程（仍存活）
       assertEquals(pm.isAlive("app-healthy"), true);
       await pm.stop("app-healthy");
@@ -338,8 +339,9 @@ test("test_restart_if_needed_进程死了_返回restarted", async () => {
       const port = pm.getPort("app-dead");
       assertEquals(port !== undefined, true, "应获取到分配端口");
       // restartIfNeeded 应重启
-      const outcome = await pm.restartIfNeeded("app-dead", dataDir, port!);
-      assertEquals(outcome, "Restarted", `应返回 Restarted，实际: ${outcome}`);
+      const result = await pm.restartIfNeeded("app-dead", dataDir, port!);
+      assertEquals(result.outcome, "Restarted", `应返回 Restarted，实际: ${result.outcome}`);
+      assertEquals(result.port, undefined, "端口未变不应携带新端口");
       assertEquals(pm.isAlive("app-dead"), true, "重启后应存活");
       await pm.stop("app-dead");
     } finally {
@@ -369,20 +371,20 @@ test("test_restart_if_needed_短窗口内超过3次_rate_limited", async () => {
         assertEquals(pid !== undefined, true, "应有子进程 PID");
         await externalKill(pid!);
         await delay(500);
-        const outcome = await pm.restartIfNeeded(
+        const result = await pm.restartIfNeeded(
           "app-ratelimit",
           dataDir,
           rlPort!,
         );
-        assertEquals(outcome, "Restarted", `第 ${i + 1} 次应 Restarted`);
+        assertEquals(result.outcome, "Restarted", `第 ${i + 1} 次应 Restarted`);
       }
       // 第 4 次调用 → 计数已 = 3（上限），应 RateLimited
-      const outcome = await pm.restartIfNeeded(
+      const result = await pm.restartIfNeeded(
         "app-ratelimit",
         dataDir,
         rlPort!,
       );
-      assertEquals(outcome, "RateLimited", "第 4 次应 RateLimited");
+      assertEquals(result.outcome, "RateLimited", "第 4 次应 RateLimited");
       // 清理
       try {
         await pm.stop("app-ratelimit");
@@ -586,9 +588,9 @@ test("test_pm_restart_健康检查失败_记录lastRestartFailure详情", async 
     const dataDir = `${tmp}/app-giveup`;
     await Deno.mkdir(dataDir, { recursive: true });
     // Act: restartIfNeeded spawn 假 PB → 立即退出 → 健康检查失败 → GiveUp
-    const outcome = await pm.restartIfNeeded("app-giveup", dataDir, 23150);
+    const result = await pm.restartIfNeeded("app-giveup", dataDir, 23150);
     // Assert: GiveUp + 进程清理 + 具体原因被记录（供 API 层透传）
-    assertEquals(outcome, "GiveUp", "健康检查失败应 GiveUp");
+    assertEquals(result.outcome, "GiveUp", "健康检查失败应 GiveUp");
     assertEquals(pm.isRunning("app-giveup"), false, "GiveUp 后进程应被清理");
     const detail = pm.lastRestartFailure.get("app-giveup");
     assertEquals(detail !== undefined, true, "应记录失败详情");
@@ -600,4 +602,61 @@ test("test_pm_restart_健康检查失败_记录lastRestartFailure详情", async 
   } finally {
     await Deno.remove(tmp, { recursive: true });
   }
+});
+
+test("test_restart_if_needed_端口被外部进程占用_换端口重启成功", async () => {
+  if (!pbBinaryAvailable()) {
+    console.warn("跳过：pocketbase 不可用");
+    return;
+  }
+  await withTestSpawnLock(async () => {
+    // busyPort 由 mock server 占用（模拟用户本机服务撞上 PB 端口段），
+    // freePort 空闲可换
+    const busyPort = 23160;
+    const freePort = 23161;
+    let onReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      onReady = resolve;
+    });
+    const server = Deno.serve(
+      {
+        hostname: "127.0.0.1",
+        port: busyPort,
+        onListen: () => onReady(),
+      },
+      () => new Response("user-service", { status: 200 }),
+    );
+    await ready;
+    const tmp = await Deno.makeTempDir();
+    try {
+      const pm = new PocketBaseProcessManager(pbBinaryPath());
+      const dataDir = `${tmp}/app-rehome`;
+      await Deno.mkdir(dataDir, { recursive: true });
+      initSuperuser(
+        pm.binary,
+        dataDir,
+        "app-rehome@test.local",
+        "test-superuser-password-12345",
+      );
+      // used 模拟 apps.json 持久化端口（含当前 app 的旧端口 busyPort）
+      const used = new Set([busyPort]);
+      const allocator = new PortAllocator(busyPort, freePort);
+      // Act: 旧端口被外部进程占用 → 应换端口重启而非 GiveUp
+      const result = await pm.restartIfNeeded(
+        "app-rehome",
+        dataDir,
+        busyPort,
+        { allocator, used },
+      );
+      // Assert: 换端口成功，返回新端口，进程在新端口健康
+      assertEquals(result.outcome, "Restarted", `应换端口重启，实际: ${result.outcome}`);
+      assertEquals(result.port, freePort, "应返回换到的空闲端口");
+      assertEquals(pm.getPort("app-rehome"), freePort, "PM 端口应更新为新端口");
+      assertEquals(pm.isAlive("app-rehome"), true, "换端口后进程应存活");
+      await pm.stop("app-rehome");
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+      await server.shutdown();
+    }
+  });
 });

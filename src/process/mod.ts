@@ -84,6 +84,31 @@ export type RestartOutcome =
   | "RateLimited"
   | "GiveUp";
 
+/**
+ * restartIfNeeded 的返回结果。
+ *
+ * Rust 原实现只返回 RestartOutcome 枚举；Deno 版扩展出 port 字段：
+ * 端口被外部进程占用且传入 fallback 时，restartIfNeeded 会换端口
+ * 重启（用户服务与 PB 端口段 9000-11000 重叠的线上场景），调用方
+ * 需要用返回的新端口更新 apps.json，否则平台重启后仍会撞旧端口。
+ */
+export interface RestartResult {
+  outcome: RestartOutcome;
+  /** 实际运行的端口；仅换端口重启成功时与传入 port 不同，其余省略 */
+  port?: number;
+}
+
+/**
+ * 端口冲突时的换端口回退参数（由调用方传入）。
+ *
+ * allocator 提供端口范围；used 是已持久化端口（apps.json）——
+ * 换端口必须跳过 used，否则会分到其他 app 正在用的端口。
+ */
+export interface PortFallback {
+  allocator: PortAllocator;
+  used: Set<number>;
+}
+
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
@@ -429,29 +454,35 @@ export class PocketBaseProcessManager {
    *
    * 调用前提：调用方已经判断需要自愈（is_alive=false 或 forward 失败）。
    *
-   * port 由调用方提供（来自 App.port 或 App.pb_port），不再随机分配。
-   * 这保证了每个 App 的端口固定，且避免了并发重启时的 TOCTOU 竞态。
+   * port 由调用方提供（来自 App.port 或 App.pb_port），通常固定。
+   * 但端口可能被外部进程占用（如用户本机服务与 PB 端口段 9000-11000
+   * 重叠的线上场景）——此时若传入 fallback，会换一个真正可绑定的
+   * 端口重启并返回新端口（调用方需更新 apps.json）；无 fallback
+   * 或换端口失败则 GiveUp。这修复了「app 端口被外部服务占用后
+   * 永远无法自愈，只能重建」的问题。
    *
    * 流程：
    * 1. 限流检查：5min×3 次超限 → RateLimited
    * 2. 清理旧 entry + 插入临时占位（← TOCTOU 防护：阻塞其他请求分到同端口）
    * 3. 端口冲突处理：isPortInUse → findAndKillConflictingPb →
-   *    非 "killed" 则 GiveUp（释放占位）
+   *    本 app 的孤儿 PB 则 kill；非 PB 进程且无 fallback 则 GiveUp；
+   *    有 fallback 则换端口继续
    * 4. spawn → 用真 ManagedProcess 替换占位
    * 5. 健康检查 → 失败则 stop + GiveUp
-   * 6. 返回 Restarted
+   * 6. 返回 Restarted（换端口时携带新端口）
    */
   async restartIfNeeded(
     appId: string,
     dataDir: string,
     port: number,
-  ): Promise<RestartOutcome> {
+    fallback?: PortFallback,
+  ): Promise<RestartResult> {
     // 注：测试串行化在测试代码层用 withTestSpawnLock 包装；此处不能再调
     // withTestSpawnLock，否则与外层测试锁嵌套 → 死锁。
     // === 1. 限流检查 ===
     if (!this.restartCounter.recordAndCheck(appId)) {
       console.warn(`5min 内重启超限，RateLimited app_id=${appId}`);
-      return "RateLimited" as RestartOutcome;
+      return { outcome: "RateLimited" as RestartOutcome };
     }
 
     // === 2. 清理旧 entry + 插入临时占位（在 async 之前！）===
@@ -461,12 +492,13 @@ export class PocketBaseProcessManager {
     if (existingProc) {
       if (existingProc.isAlive?.()) {
         // 还活着（race）→ 不重启
-        return "StillHealthy" as RestartOutcome;
+        return { outcome: "StillHealthy" as RestartOutcome };
       }
       // 已退出 → 清理
       this.processes.delete(appId);
     }
     this.processes.set(appId, { port } as ManagedProcess);
+    const requestedPort = port;
 
     // === 3. 端口冲突处理 ===
     if (await PocketBaseProcessManager.isPortInUse(port)) {
@@ -475,18 +507,32 @@ export class PocketBaseProcessManager {
       if (outcome === "killed") {
         // 已 kill，继续 spawn
       } else if (outcome === "not-target") {
-        this.processes.delete(appId); // 释放占位
-        const reason = `端口被非 pocketbase 进程占用，放弃重启避免误杀 port=${port}`;
-        console.error(`${reason} app_id=${appId}`);
-        this.lastRestartFailure.set(appId, reason);
-        return "GiveUp" as RestartOutcome;
+        // 端口被非 pocketbase 进程占用（如用户本机服务）：有 fallback 则
+        // 换端口重启，否则 GiveUp。换端口需要跳过已持久化端口（used），
+        // 且必须探测真实可绑定性（used 不含外部进程占用的端口）。
+        const newPort = fallback ? allocateProbedPort(fallback.allocator, fallback.used) : 0;
+        if (newPort !== 0 && newPort !== port) {
+          console.warn(
+            `端口 ${port} 被非 pocketbase 进程占用，换端口 ${newPort} 重启 app_id=${appId}`,
+          );
+          // 更新占位端口（同步段，防并发重启请求分到旧端口）
+          this.processes.set(appId, { port: newPort } as ManagedProcess);
+          port = newPort;
+        } else {
+          this.processes.delete(appId); // 释放占位
+          const reason =
+            `端口被非 pocketbase 进程占用，且无可用换端口，放弃重启避免误杀 port=${requestedPort}`;
+          console.error(`${reason} app_id=${appId}`);
+          this.lastRestartFailure.set(appId, reason);
+          return { outcome: "GiveUp" as RestartOutcome };
+        }
       } else {
         this.processes.delete(appId); // 释放占位
         // outcome === 'detect-error'
-        const reason = `端口冲突检测/清理失败，放弃重启避免端口冲突 port=${port}`;
+        const reason = `端口冲突检测/清理失败，放弃重启避免端口冲突 port=${requestedPort}`;
         console.error(`${reason} app_id=${appId}`);
         this.lastRestartFailure.set(appId, reason);
-        return "GiveUp" as RestartOutcome;
+        return { outcome: "GiveUp" as RestartOutcome };
       }
     }
 
@@ -503,14 +549,14 @@ export class PocketBaseProcessManager {
         console.error(
           `数据目录不是目录，GiveUp app_id=${appId} dataDir=${dataDir}`,
         );
-        return "GiveUp" as RestartOutcome;
+        return { outcome: "GiveUp" as RestartOutcome };
       }
     } catch {
       this.processes.delete(appId);
       console.error(
         `数据目录不存在，GiveUp app_id=${appId} dataDir=${dataDir}`,
       );
-      return "GiveUp" as RestartOutcome;
+      return { outcome: "GiveUp" as RestartOutcome };
     }
 
     const args = buildServeArgs(dataDir, port, `/${appId}/`);
@@ -568,10 +614,13 @@ export class PocketBaseProcessManager {
       } catch {
         // 忽略回滚失败
       }
-      return "GiveUp" as RestartOutcome;
+      return { outcome: "GiveUp" as RestartOutcome };
     }
     console.info(`PocketBase 重启成功 app_id=${appId} port=${port}`);
-    return "Restarted" as RestartOutcome;
+    return {
+      outcome: "Restarted" as RestartOutcome,
+      ...(port !== requestedPort ? { port } : {}),
+    };
   }
 
   /**
@@ -672,6 +721,25 @@ export class PocketBaseProcessManager {
 // ---------------------------------------------------------------------------
 // 辅助函数
 // ---------------------------------------------------------------------------
+
+/**
+ * 在 allocator 范围内找一个「未被持久化端口占用」且「真实可绑定」的端口。
+ *
+ * 与 start() 的 allocate+probe 两段式不同：换端口必须一次到位——used
+ * 只包含 apps.json 已持久化端口，**不含外部进程占用**（如用户本机服务），
+ * 若只查 used 会再次分到冲突端口。因此逐端口探测可绑定性。
+ * 调用方保证同步段内调用（probe 与后续 spawn 之间无 await）。
+ *
+ * @returns 空闲端口；范围耗尽返回 0
+ */
+function allocateProbedPort(allocator: PortAllocator, used: Set<number>): number {
+  for (let p = allocator.min; p <= allocator.max; p++) {
+    if (used.has(p)) continue;
+    if (!probePortFree(p)) continue;
+    return p;
+  }
+  return 0;
+}
 
 /** Promise 化的 setTimeout */
 function delay(ms: number): Promise<void> {

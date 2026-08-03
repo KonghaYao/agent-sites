@@ -29,7 +29,8 @@ import type { App } from "./app/model.ts";
 import { DEFAULT_MAX_BODY_BYTES, forward, isRecoverableError } from "./proxy/mod.ts";
 import { serveFileFromRoot } from "./static_files/mod.ts";
 import { AppError } from "./error.ts";
-import type { RestartOutcome } from "./process/mod.ts";
+import type { RestartResult } from "./process/mod.ts";
+import { PortAllocator } from "./process/port_allocator.ts";
 import type { AppState } from "./state.ts";
 import type { Ctx, Handler } from "./api/apps.ts";
 import {
@@ -543,16 +544,35 @@ async function handleProxyWithRecovery(
 ): Promise<Response> {
   const dataDir = `${state.dataDir}/${appId}`;
 
-  const outcome: RestartOutcome = await state.processManager
-    .restartIfNeeded(appId, dataDir, app.port);
+  // fallback：端口被外部进程占用（用户服务与 PB 端口段重叠）时换端口重启。
+  // used 合并持久化端口 + PM 内存端口，避免换端口分到其他 app 的端口。
+  const usedPorts = await state.store.usedPorts();
+  for (const p of state.processManager.processes.values()) usedPorts.add(p.port);
+  const allocator = new PortAllocator(state.portMin, state.portMax);
+  const result: RestartResult = await state.processManager
+    .restartIfNeeded(appId, dataDir, app.port, { allocator, used: usedPorts });
 
-  if (outcome === "Restarted" || outcome === "StillHealthy") {
-    // restart 可能分配新端口（PM entry 缺失时），从 PM 读实时端口而非用 app.port
+  if (result.outcome === "Restarted" || result.outcome === "StillHealthy") {
+    // restart 可能换端口或分配新端口（PM entry 缺失时），从 PM 读实时端口
     const port = state.processManager.getPort(appId);
     if (port === undefined) {
       throw AppError.Internal(
         `restart 后 PM 中找不到 ${appId} 的端口（内部状态不一致）`,
       );
+    }
+    // 端口变更（换端口重启成功）→ 持久化，否则平台重启后仍撞旧端口
+    if (port !== app.port) {
+      const updated = {
+        ...app,
+        port,
+        updated_at: new Date().toISOString(),
+      };
+      await state.store.update(updated);
+      await state.store.flush().catch((e) => {
+        console.warn(
+          `flush apps.json 失败（换端口 ${port} 未持久化） error=${(e as Error).message}`,
+        );
+      });
     }
     return await forward({
       port,
@@ -566,7 +586,7 @@ async function handleProxyWithRecovery(
   }
 
   // RateLimited | GiveUp：同步 status=Error + flush
-  const reason = outcome === "RateLimited"
+  const reason = result.outcome === "RateLimited"
     ? "5分钟内重启超限（3次）"
     : "重启失败：健康检查超时或端口冲突";
   const updated = {
@@ -630,11 +650,35 @@ async function serveCustomProxy(
     // enable_pb：确保 PB 进程存活后再启动 custom 进程
     if (app.enable_pb && app.pb_port && app.pb_port > 0) {
       try {
-        await state.processManager.restartIfNeeded(
+        // 端口冲突时允许换端口；换端口后更新 app.pb_port 持久化
+        const usedPorts = await state.store.usedPorts();
+        for (const p of state.processManager.processes.values()) {
+          usedPorts.add(p.port);
+        }
+        const allocator = new PortAllocator(state.portMin, state.portMax);
+        const result = await state.processManager.restartIfNeeded(
           appId,
           `${state.dataDir}/${appId}`,
           app.pb_port,
+          { allocator, used: usedPorts },
         );
+        const newPbPort = state.processManager.getPort(appId);
+        if (newPbPort !== undefined && newPbPort !== app.pb_port) {
+          // 换端口重启成功 → 持久化 pb_port，否则平台重启后仍撞旧端口
+          // （app 是函数参数 const，用局部对象传给 store）
+          const updated = {
+            ...app,
+            pb_port: newPbPort,
+            updated_at: new Date().toISOString(),
+          };
+          await state.store.update(updated).catch(() => {});
+          await state.store.flush().catch(() => {});
+        }
+        if (result.outcome === "GiveUp" || result.outcome === "RateLimited") {
+          throw new Error(
+            `PB 重启失败: ${state.processManager.lastRestartFailure.get(appId) ?? result.outcome}`,
+          );
+        }
       } catch (e) {
         console.warn(
           `惰性重启: PB 重启失败 app_id=${appId} error=${(e as Error).message}`,

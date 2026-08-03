@@ -240,22 +240,41 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
   let pbUrl: string | undefined;
   let pbSuperuserEmail: string | undefined;
   let pbSuperuserPassword: string | undefined;
+  /** PB 换端口后的实际端口（未换则保持 app.pb_port） */
+  let pbPortAfterRestart: number | undefined;
   if (app.enable_pb && app.pb_port && app.pb_port > 0) {
     try {
-      await state.processManager.restartIfNeeded(
+      // 端口被外部进程占用时允许换端口重启，返回新端口供 pbUrl 与持久化
+      const pbUsed = new Set(usedPorts);
+      for (const p of state.processManager.processes.values()) {
+        pbUsed.add(p.port);
+      }
+      const pbAllocator = new PortAllocator(state.portMin, state.portMax);
+      const pbResult = await state.processManager.restartIfNeeded(
         id,
         `${state.dataDir}/${id}`,
         app.pb_port!,
+        { allocator: pbAllocator, used: pbUsed },
       );
+      const actualPbPort = state.processManager.getPort(id);
+      if (actualPbPort !== undefined && actualPbPort !== app.pb_port) {
+        // app 是函数参数（const），换端口结果通过变量传递到 updated 持久化
+        pbPortAfterRestart = actualPbPort;
+      }
+      if (pbResult.outcome === "GiveUp" || pbResult.outcome === "RateLimited") {
+        throw new Error(
+          `PB 重启失败: ${state.processManager.lastRestartFailure.get(id) ?? pbResult.outcome}`,
+        );
+      }
+      pbUrl = `http://127.0.0.1:${actualPbPort ?? app.pb_port}`;
+      pbSuperuserEmail = app.superuser_email;
+      pbSuperuserPassword = app.superuser_password;
     } catch (e) {
       console.warn(
         `enable_pb: PB 重启失败 app_id=${id} error=${(e as Error).message}`,
       );
       throw AppError.ServiceUnavailable(`App ${id} PB 后端不可用`);
     }
-    pbUrl = `http://127.0.0.1:${app.pb_port}`;
-    pbSuperuserEmail = app.superuser_email;
-    pbSuperuserPassword = app.superuser_password;
   }
 
   // 8. 启动新进程 + 探活
@@ -277,6 +296,7 @@ export async function deployApp(req: Request, ctx: Ctx): Promise<Response> {
     active_slot: targetSlot,
     entry_file: entryFile,
     port: newPort,
+    ...(pbPortAfterRestart !== undefined ? { pb_port: pbPortAfterRestart } : {}),
     status: "running" as const,
     updated_at: new Date().toISOString(),
   };
