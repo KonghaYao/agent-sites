@@ -122,21 +122,64 @@ export function healthCheckUrl(port: number): string {
 }
 
 /**
+ * 探测端口是否可被绑定（用于 spawn 前检查端口占用）。
+ *
+ * 背景：PocketBase spawn 到被外部进程占用的端口时 bind 失败立即退出，
+ * 但健康检查可能连到端口上**其他实例**的 /api/health 返回 200 → 假健康
+ * （apps.json 里同端口多个 running 记录就是这么来的）。spawn 前先探测，
+ * 端口被占直接失败，从源头消除该竞态。
+ *
+ * 语义（保守）：任一地址族被占用即判为不可用。
+ * - IPv4（127.0.0.1）被占 → 判占用。PB `--http=localhost:port` 与健康
+ *   检查 fetch 通常都走 127.0.0.1，这是最常见的占用场景。
+ * - IPv6（::1）被占（EADDRINUSE）→ 判占用：此时健康检查 fetch 可能解析
+ *   到 ::1 连上其他实例（假健康），宁可显式失败也不静默错乱。
+ * - 无 IPv6 支持（EAFNOSUPPORT 等环境性错误）→ 不算占用，放行。
+ */
+export function probePortFree(port: number): boolean {
+  // IPv4 探测
+  let listener: Deno.Listener | undefined;
+  try {
+    listener = Deno.listen({ hostname: "127.0.0.1", port });
+  } catch {
+    return false;
+  } finally {
+    listener?.close();
+  }
+  // IPv6 探测
+  try {
+    const v6 = Deno.listen({ hostname: "::1", port });
+    v6.close();
+  } catch (e) {
+    if ((e as { code?: string }).code === "EADDRINUSE") return false;
+    // 其他错误（EAFNOSUPPORT / ENODEV 等）视为环境无 IPv6 支持，放行
+  }
+  return true;
+}
+
+/**
  * 轮询健康检查端点，最多等 timeoutSecs 秒。
  *
  * Issue #7：原 Rust 实现用 `reqwest::Client::builder().build().unwrap()`
  * 在生产路径 panic，违反 CLAUDE.md「unwrap 仅用于构造测试数据」。迁移到
  * Deno 用原生 fetch + AbortSignal.timeout 实现，无构造失败路径。
  *
+ * `isAlive` 回调（可选）：spawn 的子进程存活检测。进程已退出时立即
+ * 返回 false，不等满 timeoutSecs，也避免 fetch 连到端口上其他实例的
+ * 假健康（进程退出 → 端口响应者不可能是本进程）。
+ *
  * 返回 bool，无需 throw。
  */
 export async function waitForHealth(
   port: number,
   timeoutSecs: number,
+  isAlive?: () => boolean,
 ): Promise<boolean> {
   const url = healthCheckUrl(port);
   const deadline = Date.now() + timeoutSecs * 1000;
   while (Date.now() < deadline) {
+    // 进程已退出（如 bind 失败）：立即失败，不白等也不误连其他实例
+    if (isAlive && !isAlive()) return false;
     // AbortSignal.timeout 的内部 timer 在 fetch 提前完成时会悬挂,
     // 导致 Deno.test 报 "Promise resolution is still pending but the event
     // loop has already resolved"。改用 AbortController + 显式 clearTimeout。
@@ -144,8 +187,16 @@ export async function waitForHealth(
     const timer = setTimeout(() => controller.abort(), 2000);
     try {
       const resp = await fetch(url, { signal: controller.signal });
-      if (resp.ok) {
-        return true;
+      try {
+        if (resp.ok) {
+          // 响应到达后再确认进程仍活着：若已退出，说明 200 来自端口上的
+          // 其他实例（假健康），必须判失败
+          if (isAlive && !isAlive()) return false;
+          return true;
+        }
+      } finally {
+        // 消费/取消响应体：避免连接与 buffer 泄漏（Deno 2 测试 sanitize 检测）
+        await resp.body?.cancel();
       }
     } catch {
       // 连接拒绝 / 超时 → 继续重试

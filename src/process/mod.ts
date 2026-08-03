@@ -19,7 +19,7 @@
 // - 5min×3 滑动窗口：单线程事件循环天然原子，无需 Mutex
 
 import { AppError } from "../error.ts";
-import { buildServeArgs, waitForHealth } from "./pocketbase.ts";
+import { buildServeArgs, probePortFree, waitForHealth } from "./pocketbase.ts";
 import { PortAllocator } from "./port_allocator.ts";
 
 // ---------------------------------------------------------------------------
@@ -237,6 +237,7 @@ export class PocketBaseProcessManager {
     dataDir: string,
     cookiePath: string,
     allocator: PortAllocator,
+    persistedPorts: Set<number> = new Set(),
   ): Promise<number> {
     // 注：原 Rust 用 tokio Mutex 串行 spawn，Deno 单线程事件循环下 spawn 是
     // 同步操作，本函数「检查已启动→分配端口→spawn→insert」天然原子（无 await
@@ -251,19 +252,29 @@ export class PocketBaseProcessManager {
       throw AppError.Internal(`创建数据目录失败: ${e}`);
     }
 
-    // === 原子段：检查已启动 → 分配端口 → spawn → insert ===
+    // === 原子段：检查已启动 → 分配端口 → 探测端口 → spawn → insert ===
     // Deno 单线程，本段内无 await 即「锁内」语义
     const existing = this.processes.get(appId);
     if (existing) {
       // 已启动 → 返回同端口
       return existing.port;
     }
-    // 扫描已用端口并分配
-    const used: Set<number> = new Set();
+    // 扫描已用端口并分配。used 必须合并**已持久化的 app 端口**
+    // （persistedPorts，来自 apps.json）：平台重启后 processes map 为空，
+    // 若只扫内存 map 会从端口下限重新分配，撞上库中记录/孤儿进程占用的
+    // 端口（线上 apps.json 大量同端口 running 记录即此 bug 所致）。
+    const used: Set<number> = new Set(persistedPorts);
     for (const p of this.processes.values()) used.add(p.port);
     const port = allocator.allocate(used);
     if (port === 0) {
       throw AppError.Conflict("端口范围耗尽");
+    }
+    // spawn 前探测端口可绑定性：被外部进程（如孤儿 PB）占用时直接失败，
+    // 避免 spawn 后 bind 失败 + 健康检查误连端口上其他实例的假健康
+    if (!probePortFree(port)) {
+      throw AppError.Internal(
+        `端口 ${port} 已被外部进程占用（app_id=${appId}）`,
+      );
     }
     // spawn（同步操作，不跨 await = 锁内）
     const args = buildServeArgs(dataDir, port, cookiePath);
@@ -288,10 +299,13 @@ export class PocketBaseProcessManager {
     } catch (e) {
       throw AppError.Internal(`PocketBase spawn 失败: ${e}`);
     }
-    this.processes.set(appId, new ManagedProcess(child, port));
+    const proc = new ManagedProcess(child, port);
+    this.processes.set(appId, proc);
 
     // === 健康检查 ===
-    const healthy = await waitForHealth(port, 30);
+    // 传 isAlive 回调：子进程退出（如 bind 失败）时立即失败，
+    // 不白等超时，也不误连端口上其他实例的假健康
+    const healthy = await waitForHealth(port, 30, () => proc.isAlive());
     if (!healthy) {
       // 失败：kill + 移除
       try {
@@ -299,7 +313,7 @@ export class PocketBaseProcessManager {
       } catch {
         // 忽略回滚失败
       }
-      throw AppError.Internal("PocketBase 健康检查超时（10s）");
+      throw AppError.Internal("PocketBase 健康检查超时（30s）");
     }
     console.info(`PocketBase 健康检查通过 app_id=${appId} port=${port}`);
     return port;
@@ -456,10 +470,13 @@ export class PocketBaseProcessManager {
       this.processes.delete(appId); // 释放占位
       throw AppError.Internal(`PocketBase 重启 spawn 失败: ${e}`);
     }
-    this.processes.set(appId, new ManagedProcess(child, port));
+    const proc = new ManagedProcess(child, port);
+    this.processes.set(appId, proc);
 
     // === 5. 健康检查 ===
-    const healthy = await waitForHealth(port, 30);
+    // 传 isAlive 回调：重启的子进程若立即退出（bind 失败/崩溃），
+    // 快速失败，不误连端口上其他实例的假健康
+    const healthy = await waitForHealth(port, 30, () => proc.isAlive());
     if (!healthy) {
       console.error(`重启后健康检查失败，GiveUp app_id=${appId} port=${port}`);
       try {

@@ -150,10 +150,24 @@ export class AppStore {
     return this.apps.length !== before;
   }
 
-  /** 返回当前所有占用端口集合（对应 Rust used_ports：HashSet<u16>）。 */
+  /**
+   * 返回当前所有已占用的端口集合。
+   *
+   * 用于端口分配前的 used 集合：`a.port`（pocketbase app 端口 +
+   * custom app 端口）+ custom + enable_pb 的 `pb_port`。漏掉 pb_port
+   * 会导致 custom 部署分配的新端口撞上某个 custom app 的 PB 实例端口。
+   * port=0（未分配/占位）不参与。
+   */
   // deno-lint-ignore require-await
   async usedPorts(): Promise<Set<number>> {
-    return new Set(this.apps.map((a) => a.port));
+    const ports = new Set<number>();
+    for (const a of this.apps) {
+      if (a.port > 0) ports.add(a.port);
+      if (a.type === "custom" && a.pb_port && a.pb_port > 0) {
+        ports.add(a.pb_port);
+      }
+    }
+    return ports;
   }
 
   /** 当前内存快照（浅克隆数组 + 每个 App 克隆，保证调用方修改不影响内部）。 */

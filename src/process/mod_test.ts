@@ -6,7 +6,7 @@
 //   - 涉及真实 PB 的 spawn 测试用 withTestSpawnLock 串行化（SQLite init 竞争 / macOS fork 限速）
 //   - 每个用例独立 Deno.makeTempDir()，结束 Deno.remove(recursive)
 //   - pbBinaryAvailable() 为 false 时 skip（复刻 Rust 的跳过逻辑）
-import { assertEquals } from "jsr:@std/assert@^1";
+import { assertEquals, assertRejects } from "jsr:@std/assert@^1";
 import { initSuperuser, pbBinaryAvailable, pbBinaryPath, withTestSpawnLock } from "./pocketbase.ts";
 import { PortAllocator } from "./port_allocator.ts";
 import { PocketBaseProcessManager, RestartCounter } from "./mod.ts";
@@ -391,3 +391,85 @@ test("test_restart_if_needed_短窗口内超过3次_rate_limited", async () => {
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// ---------------------------------------------------------------------------
+// 端口分配查库修复（Issue：平台重启后 PM 内存 map 为空，used 只扫内存会
+// 撞上 apps.json 中已持久化的端口；spawn 前探测端口占用防假健康）
+// ---------------------------------------------------------------------------
+
+test("test_pm_start_合并persistedPorts_跳过库中已占用端口", async () => {
+  if (!pbBinaryAvailable()) {
+    console.warn("跳过：pocketbase 二进制不可用");
+    return;
+  }
+  await withTestSpawnLock(async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const pm = new PocketBaseProcessManager(pbBinaryPath());
+      const portMin = 23000; // mod_test 独立端口段
+      const portMax = 23099;
+      const allocator = new PortAllocator(portMin, portMax);
+      const dataDir = `${tmp}/app-persisted`;
+      await Deno.mkdir(dataDir, { recursive: true });
+      initSuperuser(
+        pm.binary,
+        dataDir,
+        "app-persisted@test.local",
+        "test-superuser-password-12345",
+      );
+      // persistedPorts 模拟 apps.json 中已有记录占用 23000
+      // （平台重启后 PM map 为空，若不合并 persistedPorts 会分配到 23000）
+      const port = await pm.start(
+        "app-persisted",
+        dataDir,
+        "/app-persisted/",
+        allocator,
+        new Set([23000]),
+      );
+      assertEquals(port, 23001, "应跳过 persistedPorts 中的 23000");
+      // 清理
+      await pm.stop("app-persisted");
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  });
+});
+
+test("test_pm_start_端口被外部进程占用_立即失败", async () => {
+  const port = 23100;
+  // mock server 占用端口，模拟孤儿 PocketBase 等外部进程
+  let onReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    onReady = resolve;
+  });
+  const server = Deno.serve(
+    {
+      hostname: "127.0.0.1",
+      port,
+      onListen: () => onReady(),
+    },
+    () => new Response("ok", { status: 200 }),
+  );
+  await ready;
+  try {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const pm = new PocketBaseProcessManager(pbBinaryPath());
+      // allocator 只允许这一个端口 → 必然撞上 mock server
+      const allocator = new PortAllocator(port, port);
+      const dataDir = `${tmp}/app-collide`;
+      await Deno.mkdir(dataDir, { recursive: true });
+      // spawn 前探测即失败：不 spawn PB、不白等健康检查、不误连 mock 的假健康
+      await assertRejects(
+        () => pm.start("app-collide", dataDir, "/app-collide/", allocator),
+        Error,
+        `端口 ${port} 已被外部进程占用`,
+      );
+      assertEquals(pm.isRunning("app-collide"), false, "不应留下进程");
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  } finally {
+    await server.shutdown();
+  }
+});

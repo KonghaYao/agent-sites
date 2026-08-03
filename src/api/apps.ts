@@ -275,14 +275,18 @@ export async function createApp(
       }
 
       // spawn PB（含端口分配 + 健康检查）
+      // 端口分配必须合并 store 中已持久化的 app 端口（persistedPorts）：
+      // 平台重启后 PM 内存 map 为空，只扫内存会撞上库中记录占用的端口
       const cookiePath = `/${id}/`;
       let actualPbPort: number;
       try {
+        const usedPorts = await state.store.usedPorts();
         actualPbPort = await state.processManager.start(
           id,
           dataDir,
           cookiePath,
           allocator,
+          usedPorts,
         );
       } catch (e) {
         await state.store.remove(app.id);
@@ -353,6 +357,9 @@ export async function createApp(
   }
 
   // 3. spawn PB（沿用 PM.start，含端口分配 + 健康检查）。
+  //    端口分配合并 store 已持久化端口（persistedPorts），防平台重启后
+  //    PM 内存 map 为空导致撞库中端口（custom deploy 路径的 usedPorts
+  //    同理，见 deploy.ts）。
   //    健康检查通过仅表示 PB 进程启动，但 superuser 凭证异步落盘可能在
   //    spawn 后还在 SQLite 异步 commit 阶段——首次代理请求会 503
   //    （凭证代换失败）。createApp 返回 200 前，主动验证一次
@@ -361,11 +368,13 @@ export async function createApp(
   const cookiePath = `/${id}/`;
   let actualPort: number;
   try {
+    const usedPorts = await state.store.usedPorts();
     actualPort = await state.processManager.start(
       id,
       dataDir,
       cookiePath,
       allocator,
+      usedPorts,
     );
   } catch (e) {
     // Issue #10：start 失败时移除占位记录，不留 Error 记录

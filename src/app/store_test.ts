@@ -156,6 +156,30 @@ Deno.test("test_store_used_ports_返回所有端口", async () => {
   }
 });
 
+// custom + enable_pb 的 pb_port 也必须进 usedPorts（否则 deploy 分配新端口
+// 会撞上某 custom app 的 PB 实例端口）
+Deno.test("test_store_used_ports_包含custom的pb_port", async () => {
+  const { tempDir, path } = await makeTempStorePath();
+  try {
+    const store = new AppStore(path, 9000, 11000);
+    await store.add({
+      ...make_app("app-aaa111", 9020, "running"),
+      type: "custom",
+      enable_pb: true,
+      pb_port: 9035,
+    });
+    await store.add(make_app("app-bbb222", 9001, "running"));
+    const ports = await store.usedPorts();
+    const arr = [...ports];
+    assertArrayIncludes(arr, [9020], "custom app 自身端口应包含");
+    assertArrayIncludes(arr, [9035], "custom 的 pb_port 应包含");
+    assertArrayIncludes(arr, [9001], "pocketbase app 端口应包含");
+    assertEquals(arr.length, 3);
+  } finally {
+    await cleanup(tempDir);
+  }
+});
+
 // Issue #5：add_if_absent 原子 check+insert
 Deno.test("test_store_add_if_absent_新id_插入成功返回true", async () => {
   const { tempDir, path } = await makeTempStorePath();
