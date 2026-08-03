@@ -281,3 +281,27 @@ Deno.test("test_store_加载时_type字段缺失_默认pocketbase", async () => 
     await cleanup(tempDir);
   }
 });
+
+Deno.test("test_store_并发flush_不抛错不丢数据", async () => {
+  // 回归：并发写共用固定 tmp 文件导致 rename ENOENT（压测发现 90% 创建失败）
+  const { tempDir, path } = await makeTempStorePath();
+  try {
+    const store = new AppStore(path, 9000, 11000);
+    const N = 20;
+    const jobs = Array.from({ length: N }, async (_, i) => {
+      await store.add(make_app(`app-${String(i).padStart(4, "0")}`, 9001 + i, "running"));
+      await store.flush();
+    });
+    // 并发 flush 全部成功且不抛错
+    await Promise.all(jobs);
+    const onDisk = JSON.parse(await Deno.readTextFile(path)) as { apps: { id: string }[] };
+    assertEquals(onDisk.apps.length, N, "磁盘应包含全部并发写入的 app");
+    // 内存与磁盘一致（最后一次 flush 是最新快照）
+    const mem = await store.list();
+    assertEquals(mem.length, N);
+    const memIds = new Set(mem.map((a) => a.id));
+    for (const a of onDisk.apps) assert(memIds.has(a.id), `磁盘 app ${a.id} 应存在于内存`);
+  } finally {
+    await cleanup(tempDir);
+  }
+});

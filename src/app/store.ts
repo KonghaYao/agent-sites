@@ -32,6 +32,15 @@ export class AppStore {
   private apps: App[];
   /** 持久化文件路径（apps.json）。 */
   private readonly path: string;
+  /**
+   * flush 串行化链：并发写都排在链尾执行。
+   *
+   * 原因：flush 用固定临时文件（apps.json.tmp）+ rename 原子替换，
+   * 并发 flush 时 A 先 rename 成功、B 再 rename 同一 tmp 会 ENOENT 失败
+   * （压测发现：20 并发创建 90% 报「持久化失败」）。且快照生成时机
+   * 放在链内（等前一个 flush 完成后再拍），避免旧快照覆盖新快照。
+   */
+  private flushChain: Promise<void> = Promise.resolve();
 
   /**
    * 创建 store 并加载磁盘上的 apps.json。
@@ -85,14 +94,26 @@ export class AppStore {
     return file;
   }
 
-  /** 持久化内存快照到 apps.json（原子写：tmp + rename）。 */
+  /** 持久化内存快照到 apps.json（原子写：tmp + rename）。
+   *  串行化执行：先排队等前一个 flush 完成，再拍快照并写入。 */
   async flush(): Promise<void> {
-    const file: StoreFile = { apps: this.snapshot() };
-    const text = JSON.stringify(file, null, 2);
-    // 原子写：先写临时文件再 rename
-    const tmpPath = this.tmpPath();
-    await Deno.writeTextFile(tmpPath, text);
-    await Deno.rename(tmpPath, this.path);
+    const prev = this.flushChain;
+    let release!: () => void;
+    this.flushChain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prev;
+    try {
+      const file: StoreFile = { apps: this.snapshot() };
+      const text = JSON.stringify(file, null, 2);
+      // 原子写：先写临时文件再 rename
+      const tmpPath = this.tmpPath();
+      await Deno.writeTextFile(tmpPath, text);
+      await Deno.rename(tmpPath, this.path);
+    } finally {
+      // 无论成败都释放链尾，保证后续 flush 不被卡死
+      release();
+    }
   }
 
   /** 返回内存快照（对应 Rust list：read guard → clone）。

@@ -61,6 +61,8 @@ function parseCli(args: string[]): Cli {
   const fromEnv: Partial<Cli> = {};
   const envHost = Deno.env.get("HOST");
   if (envHost !== undefined) fromEnv.host = envHost;
+  const envPort = Deno.env.get("PORT");
+  if (envPort !== undefined) fromEnv.port = parseInt(envPort, 10);
   const envPbBinary = Deno.env.get("PB_BINARY");
   if (envPbBinary !== undefined) fromEnv.pbBinary = envPbBinary;
   const envDataDir = Deno.env.get("DATA_DIR");

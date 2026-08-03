@@ -289,24 +289,29 @@ export async function createApp(
           usedPorts,
         );
       } catch (e) {
+        // 并发删除竞态：创建期间被 DELETE → 记录已消失（进程已由
+        // PM.start 内部回滚 kill）→ 返回 200 而非 500，避免无谓重试
+        const concurrentDeleted = (await state.store.get(app.id)) === undefined;
         await state.store.remove(app.id);
         await state.store.flush().catch(() => {});
         await Deno.remove(dataDir, { recursive: true }).catch(() => {});
+        if (concurrentDeleted) return Response.json({ data: null, error: null });
         throw e instanceof AppError ? e : AppError.Internal(`${e}`);
       }
 
+      // 并发删除竞态防护：start 成功后 app 记录已消失 → 回滚进程防泄漏
+      const rolled = await rollbackIfConcurrentlyDeleted(state, id, dataDir);
+      if (rolled) return rolled;
+
       // 验证 superuser 凭证可用（消除异步落盘竞态）
-      try {
-        await verifySuperuserReady(
-          actualPbPort,
-          superuserEmail,
-          superuserPassword,
-        );
-      } catch (e) {
-        console.warn(
-          `superuser 凭证验证失败 app_id=${id} error=${(e as Error).message}`,
-        );
-      }
+      await verifySuperuserWithRetry(
+        state,
+        dataDir,
+        actualPbPort,
+        superuserEmail,
+        superuserPassword,
+        id,
+      );
 
       app.enable_pb = true;
       app.pb_port = actualPbPort;
@@ -377,25 +382,32 @@ export async function createApp(
       usedPorts,
     );
   } catch (e) {
+    // 并发删除竞态：创建期间被 DELETE → 记录已消失（进程已由
+    // PM.start 内部回滚 kill）→ 返回 200 而非 500，避免无谓重试
+    const concurrentDeleted = (await state.store.get(app.id)) === undefined;
     // Issue #10：start 失败时移除占位记录，不留 Error 记录
     await state.store.remove(app.id);
     await state.store.flush().catch(() => {});
     // init 已成功 → data_dir 含预置 superuser 的 SQLite，需一并清理。
     // id 是 uuid v4 随机，重试不会复用同 id，不会发生幂等覆盖，故直接删目录。
     await Deno.remove(dataDir, { recursive: true }).catch(() => {});
+    if (concurrentDeleted) return Response.json({ data: null, error: null });
     throw e instanceof AppError ? e : AppError.Internal(`${e}`);
   }
 
-  // 4. 验证 superuser 凭证可用（重试 3 次，每次间隔 500ms）
-  try {
-    await verifySuperuserReady(actualPort, superuserEmail, superuserPassword);
-  } catch (e) {
-    console.warn(
-      `superuser 凭证验证失败 app_id=${id} error=${(e as Error).message}`,
-    );
-    // 不阻塞创建流程——保留 PM.start 成功的事实，让后续代理层自愈重试。
-    // 此处只记 warn，避免把可恢复的竞态硬升为创建失败。
-  }
+  // 并发删除竞态防护：start 成功后 app 记录已消失 → 回滚进程防泄漏
+  const rolled = await rollbackIfConcurrentlyDeleted(state, id, dataDir);
+  if (rolled) return rolled;
+
+  // 4. 验证 superuser 凭证可用（失败自动重新 upsert 再验一轮，仍失败仅 warn）
+  await verifySuperuserWithRetry(
+    state,
+    dataDir,
+    actualPort,
+    superuserEmail,
+    superuserPassword,
+    id,
+  );
 
   // Issue #10：用实际 port + Running + 凭证持久化
   app.port = actualPort;
@@ -558,6 +570,73 @@ const PLACEHOLDER_HTML = `<!doctype html>
  *
  * 用 AbortController + 显式 clearTimeout（CLAUDE.md：禁用 AbortSignal.timeout 防止悬挂 timer）。
  */
+/**
+ * 验证 superuser 凭证可用（消除异步落盘竞态）。
+ *
+ * 压测发现偶发「auth-with-password 重试 3 次仍未通过」（约 1/70 创建）：
+ * verifySuperuserReady 内部 3 次快速重试只覆盖 SQLite 异步 commit 窗口，
+ * 若 upsert 因其他原因（如进程退出竞态）未生效，重试无效。此处失败后
+ * 重新 initSuperuser（upsert 幂等）再验证一轮，仍失败仅 warn 不阻塞。
+ */
+async function verifySuperuserWithRetry(
+  state: Ctx["state"],
+  dataDir: string,
+  port: number,
+  email: string,
+  password: string,
+  appId: string,
+): Promise<void> {
+  for (let round = 0; round < 2; round++) {
+    try {
+      await verifySuperuserReady(port, email, password);
+      return;
+    } catch (e) {
+      // 并发删除竞态：进程已被回收（app 被 DELETE，SIGTERM 后进程进入
+      // 关闭流程时 auth 会拒 400）→ 无需验证，静默返回
+      if (!state.processManager.isRunning(appId)) return;
+      console.warn(
+        `superuser 凭证验证失败（第 ${round + 1} 轮）app_id=${appId} error=${(e as Error).message}`,
+      );
+      if (round === 0) {
+        // 重新 upsert（幂等更新密码）后再验证一轮
+        try {
+          initSuperuser(state.pbBinary, dataDir, email, password);
+        } catch (e2) {
+          console.warn(
+            `重新预置 superuser 失败 app_id=${appId} error=${(e2 as Error).message}`,
+          );
+        }
+      }
+    }
+  }
+}
+
+/**
+ * 并发删除竞态防护（创建期间 app 被并发 DELETE）。
+ *
+ * 压测发现两类问题（同一竞态的两个变体）：
+ * 1. DELETE 在 spawn 前到达 → start() 继续 spawn PB → 健康检查通过 →
+ *    store.update 对已删除 id 是 no-op → 200 但记录消失 + PB 进程活着
+ *    = 孤儿进程 + 端口泄漏。
+ * 2. DELETE 在健康检查期间到达 → isAlive 快速失败 → 500 假失败
+ *    （app 其实创建成功后被删，客户端无谓重试）。
+ *
+ * 本函数在 start() 成功后调用：记录已消失 → 回滚进程与目录，返回 200
+ * （创建请求已完成，结果被并发操作消费）；仍在 → 返回 null 继续流程。
+ */
+async function rollbackIfConcurrentlyDeleted(
+  state: Ctx["state"],
+  id: string,
+  dataDir: string,
+): Promise<Response | null> {
+  const still = await state.store.get(id);
+  if (still) return null;
+  await state.processManager.stop(id).catch(() => {});
+  await state.customProcessManager.stop(id).catch(() => {});
+  await Deno.remove(dataDir, { recursive: true }).catch(() => {});
+  return Response.json({ data: null, error: null });
+}
+
 async function verifySuperuserReady(
   port: number,
   email: string,
@@ -565,6 +644,7 @@ async function verifySuperuserReady(
 ): Promise<void> {
   const url = `http://localhost:${port}/api/collections/_superusers/auth-with-password`;
   const maxAttempts = 3;
+  let lastDetail = "无响应";
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 2000);
@@ -576,9 +656,13 @@ async function verifySuperuserReady(
         signal: controller.signal,
       });
       if (resp.ok) return;
-      // 400/401 视为凭证尚未生效，重试
-    } catch {
+      // 400/401 视为凭证尚未生效，重试；记录详情便于诊断偶发失败
+      lastDetail = `status=${resp.status} body=${
+        (await resp.text().catch(() => "")).slice(0, 200)
+      }`;
+    } catch (e) {
       // 连接拒绝/超时，重试
+      lastDetail = `异常: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
       clearTimeout(timer);
     }
@@ -587,6 +671,6 @@ async function verifySuperuserReady(
     }
   }
   throw new Error(
-    `superuser auth-with-password 重试 ${maxAttempts} 次仍未通过`,
+    `superuser auth-with-password 重试 ${maxAttempts} 次仍未通过（${lastDetail}）`,
   );
 }

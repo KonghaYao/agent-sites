@@ -435,7 +435,7 @@ test("test_pm_start_合并persistedPorts_跳过库中已占用端口", async () 
   });
 });
 
-test("test_pm_start_端口被外部进程占用_立即失败", async () => {
+test("test_pm_start_端口被外部进程占用_无端口可换_报端口耗尽", async () => {
   const port = 23100;
   // mock server 占用端口，模拟孤儿 PocketBase 等外部进程
   let onReady!: () => void;
@@ -455,7 +455,7 @@ test("test_pm_start_端口被外部进程占用_立即失败", async () => {
     const tmp = await Deno.makeTempDir();
     try {
       const pm = new PocketBaseProcessManager(pbBinaryPath());
-      // allocator 只允许这一个端口 → 必然撞上 mock server
+      // allocator 只允许这一个端口 → 探测失败后无端口可换
       const allocator = new PortAllocator(port, port);
       const dataDir = `${tmp}/app-collide`;
       await Deno.mkdir(dataDir, { recursive: true });
@@ -463,9 +463,53 @@ test("test_pm_start_端口被外部进程占用_立即失败", async () => {
       await assertRejects(
         () => pm.start("app-collide", dataDir, "/app-collide/", allocator),
         Error,
-        `端口 ${port} 已被外部进程占用`,
+        "端口范围耗尽",
       );
       assertEquals(pm.isRunning("app-collide"), false, "不应留下进程");
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  } finally {
+    await server.shutdown();
+  }
+});
+
+test("test_pm_start_端口被外部进程占用_换端口重试成功", async () => {
+  const busyPort = 23110;
+  const freePort = 23111;
+  // mock server 占用 busyPort，模拟刚停止未死透的进程（端口释放延迟）
+  let onReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    onReady = resolve;
+  });
+  const server = Deno.serve(
+    {
+      hostname: "127.0.0.1",
+      port: busyPort,
+      onListen: () => onReady(),
+    },
+    () => new Response("ok", { status: 200 }),
+  );
+  await ready;
+  try {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const pm = new PocketBaseProcessManager(pbBinaryPath());
+      initSuperuser(
+        pm.binary,
+        `${tmp}/app-collide-retry`,
+        "app-collide-retry@test.local",
+        "test-superuser-password-12345",
+      );
+      const allocator = new PortAllocator(busyPort, freePort);
+      const dataDir = `${tmp}/app-collide-retry`;
+      await Deno.mkdir(dataDir, { recursive: true });
+      // 探测 busyPort 失败 → 记入 used 换 freePort 重试 → 成功
+      const port = await pm.start("app-collide-retry", dataDir, "/app-collide-retry/", allocator);
+      assertEquals(port, freePort, "应换到空闲端口");
+      assertEquals(pm.isRunning("app-collide-retry"), true, "进程应运行");
+      await pm.stop("app-collide-retry");
+      assertEquals(pm.isRunning("app-collide-retry"), false, "停止后不应在运行");
     } finally {
       await Deno.remove(tmp, { recursive: true });
     }

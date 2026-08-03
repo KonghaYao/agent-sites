@@ -265,15 +265,33 @@ export class PocketBaseProcessManager {
     // 端口（线上 apps.json 大量同端口 running 记录即此 bug 所致）。
     const used: Set<number> = new Set(persistedPorts);
     for (const p of this.processes.values()) used.add(p.port);
-    const port = allocator.allocate(used);
-    if (port === 0) {
-      throw AppError.Conflict("端口范围耗尽");
-    }
     // spawn 前探测端口可绑定性：被外部进程（如孤儿 PB）占用时直接失败，
-    // 避免 spawn 后 bind 失败 + 健康检查误连端口上其他实例的假健康
-    if (!probePortFree(port)) {
+    // 避免 spawn 后 bind 失败 + 健康检查误连端口上其他实例的假健康。
+    //
+    // 端口释放延迟竞态（压测发现）：并发 DELETE 的 stop() 在 await 等进程
+    // 退出（SIGTERM→退出有延迟）期间让出事件循环，新创建请求的 probe 会
+    // 命中「正在退出但未死透」的端口 → 误失败 500。此处把失败端口记入
+    // used 并等待片刻后换端口重试，主路径（probe 成功）仍无 await 保持
+    // 原子段语义；probe 失败是异常路径，让出不会造成双 spawn（probe 是
+    // 内核级占用检查，忙的端口任何请求都 probe 失败）。
+    const PROBE_MAX_ATTEMPTS = 3;
+    const PROBE_RETRY_DELAY_MS = 300;
+    let port = 0;
+    for (let attempt = 0; attempt < PROBE_MAX_ATTEMPTS; attempt++) {
+      port = allocator.allocate(used);
+      if (port === 0) {
+        throw AppError.Conflict("端口范围耗尽");
+      }
+      if (probePortFree(port)) break;
+      used.add(port);
+      port = 0;
+      if (attempt < PROBE_MAX_ATTEMPTS - 1) {
+        await new Promise((r) => setTimeout(r, PROBE_RETRY_DELAY_MS));
+      }
+    }
+    if (port === 0) {
       throw AppError.Internal(
-        `端口 ${port} 已被外部进程占用（app_id=${appId}）`,
+        `端口探测失败（重试 ${PROBE_MAX_ATTEMPTS} 次仍被占用）app_id=${appId}`,
       );
     }
     // spawn（同步操作，不跨 await = 锁内）
