@@ -447,6 +447,28 @@ export class PocketBaseProcessManager {
     }
 
     // === 4. spawn（用真 ManagedProcess 替换占位）===
+    // 检查数据目录是否存在——restartIfNeeded 语义是"重启已有 app"，
+    // 若目录被外部删除，直接 GiveUp 并给出明确错误（避免 PB 自动创建空数据库、
+    // 等同于静默数据丢失）。
+    // 注意：start() 有 Deno.mkdir（首次创建），restartIfNeeded 不应复制该行为，
+    // 否则会掩盖目录被删除的真实原因。
+    try {
+      const dirInfo = await Deno.stat(dataDir);
+      if (!dirInfo.isDirectory) {
+        this.processes.delete(appId);
+        console.error(
+          `数据目录不是目录，GiveUp app_id=${appId} dataDir=${dataDir}`,
+        );
+        return "GiveUp" as RestartOutcome;
+      }
+    } catch {
+      this.processes.delete(appId);
+      console.error(
+        `数据目录不存在，GiveUp app_id=${appId} dataDir=${dataDir}`,
+      );
+      return "GiveUp" as RestartOutcome;
+    }
+
     const args = buildServeArgs(dataDir, port, `/${appId}/`);
     console.info(
       `重启 PocketBase 进程 app_id=${appId} port=${port} args=${JSON.stringify(args)}`,
@@ -457,7 +479,7 @@ export class PocketBaseProcessManager {
         args,
         stdin: "null",
         stdout: "null",
-        stderr: "null",
+        stderr: "piped",
         // clearEnv: true + env 配合实现完全替换。
         // Deno 2.x 默认会把 env 字段合并到继承的父进程 env 上（与 Node
         // child_process 不同），仅传 env 不足以阻挡 AGENT_SITES_MASTER_KEY
@@ -478,7 +500,19 @@ export class PocketBaseProcessManager {
     // 快速失败，不误连端口上其他实例的假健康
     const healthy = await waitForHealth(port, 30, () => proc.isAlive());
     if (!healthy) {
-      console.error(`重启后健康检查失败，GiveUp app_id=${appId} port=${port}`);
+      // 区分两类失败：进程退出（crashed）vs 进程存活但不响应 HTTP
+      const waitResult = proc.tryWait();
+      if (waitResult !== null) {
+        console.error(
+          `重启后健康检查失败（进程已退出，exitCode=${waitResult.code}），` +
+            `GiveUp app_id=${appId} port=${port}`,
+        );
+      } else {
+        console.error(
+          `重启后健康检查失败（进程未退出但 HTTP 无响应），` +
+            `GiveUp app_id=${appId} port=${port}`,
+        );
+      }
       try {
         await this.stop(appId);
       } catch {
