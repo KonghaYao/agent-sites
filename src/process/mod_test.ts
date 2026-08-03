@@ -53,6 +53,18 @@ async function externalKill(pid: number): Promise<void> {
 }
 
 /**
+ * 写一个「假 PocketBase」shell 脚本，用于测试 spawn 后进程立即退出 /
+ * 健康检查窗口内被 stop 等失败路径（不需要真实 PB，避免 spawn 锁）。
+ * body 是脚本正文（如 `exit 1` / `sleep 5`）。
+ */
+async function writeFakeBinary(tmpDir: string, body: string): Promise<string> {
+  const p = `${tmpDir}/fake-pb`;
+  await Deno.writeTextFile(p, `#!/bin/sh\n${body}\n`);
+  await Deno.chmod(p, 0o755);
+  return p;
+}
+
+/**
  * 本文件统一 test 包装器（默认禁用 sanitize* 选项）。
  *
  * 现实限制：源码 PM.stop()（src/process/mod.ts:314）的 Promise.race 用
@@ -515,5 +527,77 @@ test("test_pm_start_端口被外部进程占用_换端口重试成功", async ()
     }
   } finally {
     await server.shutdown();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 健康检查失败诊断（修复「健康检查超时」不给出任何细节）
+// 用假二进制（shell 脚本）驱动失败路径，不需要真实 PB 与 spawn 锁
+// ---------------------------------------------------------------------------
+
+test("test_pm_start_健康检查失败_进程立即退出_错误消息含exitCode", async () => {
+  const tmp = await Deno.makeTempDir();
+  try {
+    const fake = await writeFakeBinary(tmp, "exit 1");
+    const pm = new PocketBaseProcessManager(fake);
+    const allocator = new PortAllocator(23120, 23129);
+    const dataDir = `${tmp}/app-fakeexit`;
+    await Deno.mkdir(dataDir, { recursive: true });
+    // Act: spawn 后进程立即退出 → 健康检查应快速失败
+    await assertRejects(
+      () => pm.start("app-fakeexit", dataDir, "/app-fakeexit/", allocator),
+      Error,
+      "exitCode=1",
+    );
+    // Assert: 失败后进程被清理，不留残留
+    assertEquals(pm.isRunning("app-fakeexit"), false, "失败后不应留下进程");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("test_pm_start_健康检查期间被并发stop_错误消息含竞态诊断", async () => {
+  const tmp = await Deno.makeTempDir();
+  try {
+    // 假 PB：sleep 5 期间进程存活但端口无监听 → 健康检查持续轮询，
+    // 为「start 窗口内被 stop」提供时间窗
+    const fake = await writeFakeBinary(tmp, "sleep 5");
+    const pm = new PocketBaseProcessManager(fake);
+    const allocator = new PortAllocator(23130, 23139);
+    const dataDir = `${tmp}/app-race`;
+    await Deno.mkdir(dataDir, { recursive: true });
+    // Act: start 进行中（健康检查窗口内）并发 stop
+    const startPromise = pm.start("app-race", dataDir, "/app-race/", allocator);
+    await delay(500); // 确保 spawn 完成、健康检查循环已开始
+    await pm.stop("app-race");
+    // Assert: 错误消息应指明是竞态而非笼统「超时」
+    await assertRejects(() => startPromise, Error, "被并发停止");
+    assertEquals(pm.isRunning("app-race"), false, "停止后不应在运行");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("test_pm_restart_健康检查失败_记录lastRestartFailure详情", async () => {
+  const tmp = await Deno.makeTempDir();
+  try {
+    const fake = await writeFakeBinary(tmp, "exit 1");
+    const pm = new PocketBaseProcessManager(fake);
+    const dataDir = `${tmp}/app-giveup`;
+    await Deno.mkdir(dataDir, { recursive: true });
+    // Act: restartIfNeeded spawn 假 PB → 立即退出 → 健康检查失败 → GiveUp
+    const outcome = await pm.restartIfNeeded("app-giveup", dataDir, 23150);
+    // Assert: GiveUp + 进程清理 + 具体原因被记录（供 API 层透传）
+    assertEquals(outcome, "GiveUp", "健康检查失败应 GiveUp");
+    assertEquals(pm.isRunning("app-giveup"), false, "GiveUp 后进程应被清理");
+    const detail = pm.lastRestartFailure.get("app-giveup");
+    assertEquals(detail !== undefined, true, "应记录失败详情");
+    assertEquals(
+      detail?.includes("exitCode=1"),
+      true,
+      `详情应包含退出码诊断: ${detail}`,
+    );
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
   }
 });

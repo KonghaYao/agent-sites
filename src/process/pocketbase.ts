@@ -158,6 +158,21 @@ export function probePortFree(port: number): boolean {
 }
 
 /**
+ * 健康检查结果：成功与否 + 最后一次失败的具体原因（可诊断性）。
+ *
+ * lastError/lastStatus 仅在 ok=false 时有意义，用于让上层错误消息
+ * 能区分「连接拒绝（进程没起来）」「HTTP 非 200（进程起来了但异常）」
+ * 「超时（一直无响应）」等失败类型，而不是笼统报「健康检查超时」。
+ */
+export interface HealthCheckResult {
+  ok: boolean;
+  /** 最后一次 fetch 异常信息（连接拒绝 / abort 等）；ok=true 时为 null */
+  lastError: string | null;
+  /** 最后一次非 200 的 HTTP 状态码；ok=true 或从未收到非 200 时为 null */
+  lastStatus: number | null;
+}
+
+/**
  * 轮询健康检查端点，最多等 timeoutSecs 秒。
  *
  * Issue #7：原 Rust 实现用 `reqwest::Client::builder().build().unwrap()`
@@ -165,21 +180,25 @@ export function probePortFree(port: number): boolean {
  * Deno 用原生 fetch + AbortSignal.timeout 实现，无构造失败路径。
  *
  * `isAlive` 回调（可选）：spawn 的子进程存活检测。进程已退出时立即
- * 返回 false，不等满 timeoutSecs，也避免 fetch 连到端口上其他实例的
+ * 返回失败，不等满 timeoutSecs，也避免 fetch 连到端口上其他实例的
  * 假健康（进程退出 → 端口响应者不可能是本进程）。
  *
- * 返回 bool，无需 throw。
+ * 返回 HealthCheckResult 而非 bool：失败时携带最后一次 fetch 的错误
+ * 与状态码，供上层拼进错误消息（修复「健康检查超时」不给出任何细节）。
+ * 不 throw。
  */
 export async function waitForHealth(
   port: number,
   timeoutSecs: number,
   isAlive?: () => boolean,
-): Promise<boolean> {
+): Promise<HealthCheckResult> {
   const url = healthCheckUrl(port);
   const deadline = Date.now() + timeoutSecs * 1000;
+  let lastError: string | null = null;
+  let lastStatus: number | null = null;
   while (Date.now() < deadline) {
     // 进程已退出（如 bind 失败）：立即失败，不白等也不误连其他实例
-    if (isAlive && !isAlive()) return false;
+    if (isAlive && !isAlive()) return { ok: false, lastError, lastStatus };
     // AbortSignal.timeout 的内部 timer 在 fetch 提前完成时会悬挂,
     // 导致 Deno.test 报 "Promise resolution is still pending but the event
     // loop has already resolved"。改用 AbortController + 显式 clearTimeout。
@@ -191,21 +210,24 @@ export async function waitForHealth(
         if (resp.ok) {
           // 响应到达后再确认进程仍活着：若已退出，说明 200 来自端口上的
           // 其他实例（假健康），必须判失败
-          if (isAlive && !isAlive()) return false;
-          return true;
+          if (isAlive && !isAlive()) return { ok: false, lastError, lastStatus };
+          return { ok: true, lastError: null, lastStatus: null };
         }
+        // 进程活着但返回非 200：记录状态码，继续轮询
+        lastStatus = resp.status;
       } finally {
         // 消费/取消响应体：避免连接与 buffer 泄漏（Deno 2 测试 sanitize 检测）
         await resp.body?.cancel();
       }
-    } catch {
-      // 连接拒绝 / 超时 → 继续重试
+    } catch (e) {
+      // 连接拒绝 / 超时 → 记录原因后继续重试
+      lastError = e instanceof Error ? e.message : String(e);
     } finally {
       clearTimeout(timer);
     }
     await delay(200);
   }
-  return false;
+  return { ok: false, lastError, lastStatus };
 }
 
 /** Promise 化的 setTimeout */

@@ -84,7 +84,7 @@ async function startMockHealthServer(
 Deno.test("test_wait_for_health_进程已退出_立即返回false", async () => {
   // isAlive 恒为 false：即使端口上有健康服务也不应去连
   const result = await waitForHealth(22602, 5, () => false);
-  assertEquals(result, false, "进程已退出应判健康检查失败");
+  assertEquals(result.ok, false, "进程已退出应判健康检查失败");
 });
 
 Deno.test("test_wait_for_health_响应200且进程存活_返回true", async () => {
@@ -92,7 +92,9 @@ Deno.test("test_wait_for_health_响应200且进程存活_返回true", async () =
   const mock = await startMockHealthServer(port);
   try {
     const result = await waitForHealth(port, 5, () => true);
-    assertEquals(result, true, "进程存活且响应 200 应通过");
+    assertEquals(result.ok, true, "进程存活且响应 200 应通过");
+    assertEquals(result.lastError, null, "成功时不应携带失败原因");
+    assertEquals(result.lastStatus, null, "成功时不应携带失败状态码");
   } finally {
     await mock.shutdown();
   }
@@ -104,9 +106,45 @@ Deno.test("test_wait_for_health_响应200但进程已退出_返回false", async 
   try {
     // 端口响应者不是本进程（isAlive=false）→ 200 是假健康，必须判失败
     const result = await waitForHealth(port, 5, () => false);
-    assertEquals(result, false, "进程已退出时端口上的 200 应视为假健康");
+    assertEquals(result.ok, false, "进程已退出时端口上的 200 应视为假健康");
   } finally {
     await mock.shutdown();
+  }
+});
+
+Deno.test("test_wait_for_health_进程存活但端口无响应_返回false且携带连接错误", async () => {
+  // 空闲端口（无监听）+ isAlive 恒 true → 一直连接拒绝，超时后应失败
+  const port = 22605;
+  const result = await waitForHealth(port, 1, () => true);
+  assertEquals(result.ok, false, "无监听端口应判健康检查失败");
+  assertEquals(
+    result.lastError !== null,
+    true,
+    "连接拒绝时 lastError 应记录具体原因",
+  );
+});
+
+Deno.test("test_wait_for_health_进程存活但返回非200_记录状态码", async () => {
+  // mock 返回 500：进程活着但健康端点异常 → 记录状态码供诊断
+  let onReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    onReady = resolve;
+  });
+  const server = Deno.serve(
+    {
+      hostname: "127.0.0.1",
+      port: 22606,
+      onListen: () => onReady(),
+    },
+    () => new Response("err", { status: 500 }),
+  );
+  await ready;
+  try {
+    const result = await waitForHealth(22606, 1, () => true);
+    assertEquals(result.ok, false, "非 200 应判健康检查失败");
+    assertEquals(result.lastStatus, 500, "应记录最后一次非 200 状态码");
+  } finally {
+    await server.shutdown();
   }
 });
 

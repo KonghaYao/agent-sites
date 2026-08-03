@@ -214,6 +214,15 @@ export class PocketBaseProcessManager {
   readonly processes: Map<string, ManagedProcess> = new Map();
   /** pub 是为测试预填方便（lib_test 直接调 record_and_check） */
   restartCounter: RestartCounter;
+  /**
+   * 最近一次 restartIfNeeded GiveUp 的具体原因（appId → 诊断文本）。
+   *
+   * 目的：GiveUp 会把 app 标 Error 并返回 503，但 RestartOutcome 枚举
+   * 不带细节，API 层只能笼统回「健康检查超时或端口冲突」。此处记录
+   * 具体原因（exitCode / 端口占用者 / 最后一次请求错误），供 lib.ts
+   * 拼进 503 响应，让 agent 拿到可行动的错误而不是猜。
+   */
+  readonly lastRestartFailure: Map<string, string> = new Map();
 
   constructor(binary: string) {
     this.binary = binary;
@@ -323,15 +332,32 @@ export class PocketBaseProcessManager {
     // === 健康检查 ===
     // 传 isAlive 回调：子进程退出（如 bind 失败）时立即失败，
     // 不白等超时，也不误连端口上其他实例的假健康
-    const healthy = await waitForHealth(port, 30, () => proc.isAlive());
-    if (!healthy) {
+    const health = await waitForHealth(port, 30, () => proc.isAlive());
+    if (!health.ok) {
+      // 失败诊断：区分「被并发 stop 打断」「进程已退出」「进程存活但无响应」
+      // 三种互斥原因，并把 waitForHealth 收集的最后 fetch 错误一并带出，
+      // 避免只抛一句笼统的「健康检查超时」让调用方无从排查。
+      const stillRegistered = this.processes.get(appId) === proc;
+      const exit = proc.tryWait();
+      let reason: string;
+      if (!stillRegistered) {
+        reason = "健康检查期间进程被并发停止（start 与 stop 竞态）";
+      } else if (exit !== null) {
+        reason = `进程已退出（exitCode=${exit.code}）`;
+      } else {
+        reason = "进程存活但 HTTP 无响应";
+      }
+      if (health.lastError !== null) reason += `，最后一次请求错误: ${health.lastError}`;
+      if (health.lastStatus !== null) reason += `，最后一次响应状态: ${health.lastStatus}`;
       // 失败：kill + 移除
       try {
         await this.stop(appId);
       } catch {
         // 忽略回滚失败
       }
-      throw AppError.Internal("PocketBase 健康检查超时（30s）");
+      throw AppError.Internal(
+        `PocketBase 健康检查超时（30s）失败原因=${reason} app_id=${appId} port=${port}`,
+      );
     }
     console.info(`PocketBase 健康检查通过 app_id=${appId} port=${port}`);
     return port;
@@ -450,16 +476,16 @@ export class PocketBaseProcessManager {
         // 已 kill，继续 spawn
       } else if (outcome === "not-target") {
         this.processes.delete(appId); // 释放占位
-        console.error(
-          `端口被非 pocketbase 进程占用，放弃重启避免误杀 app_id=${appId} port=${port}`,
-        );
+        const reason = `端口被非 pocketbase 进程占用，放弃重启避免误杀 port=${port}`;
+        console.error(`${reason} app_id=${appId}`);
+        this.lastRestartFailure.set(appId, reason);
         return "GiveUp" as RestartOutcome;
       } else {
         this.processes.delete(appId); // 释放占位
         // outcome === 'detect-error'
-        console.error(
-          `端口冲突检测/清理失败，放弃重启避免端口冲突 app_id=${appId} port=${port}`,
-        );
+        const reason = `端口冲突检测/清理失败，放弃重启避免端口冲突 port=${port}`;
+        console.error(`${reason} app_id=${appId}`);
+        this.lastRestartFailure.set(appId, reason);
         return "GiveUp" as RestartOutcome;
       }
     }
@@ -497,7 +523,10 @@ export class PocketBaseProcessManager {
         args,
         stdin: "null",
         stdout: "null",
-        stderr: "piped",
+        // 实测 PocketBase 0.23.x serve 日志走 stdout（已 null），stderr 基本
+        // 不写；但为防御未来版本/其他二进制写 stderr，统一 null 避免
+        // piped 无人消费导致管道缓冲区满 → 子进程写阻塞假死。
+        stderr: "null",
         // clearEnv: true + env 配合实现完全替换。
         // Deno 2.x 默认会把 env 字段合并到继承的父进程 env 上（与 Node
         // child_process 不同），仅传 env 不足以阻挡 AGENT_SITES_MASTER_KEY
@@ -516,21 +545,24 @@ export class PocketBaseProcessManager {
     // === 5. 健康检查 ===
     // 传 isAlive 回调：重启的子进程若立即退出（bind 失败/崩溃），
     // 快速失败，不误连端口上其他实例的假健康
-    const healthy = await waitForHealth(port, 30, () => proc.isAlive());
-    if (!healthy) {
-      // 区分两类失败：进程退出（crashed）vs 进程存活但不响应 HTTP
+    const health = await waitForHealth(port, 30, () => proc.isAlive());
+    if (!health.ok) {
+      // 区分两类失败：进程退出（crashed）vs 进程存活但不响应 HTTP，
+      // 并附上 waitForHealth 收集的最后 fetch 错误/状态码
       const waitResult = proc.tryWait();
+      let detail: string;
       if (waitResult !== null) {
-        console.error(
-          `重启后健康检查失败（进程已退出，exitCode=${waitResult.code}），` +
-            `GiveUp app_id=${appId} port=${port}`,
-        );
+        detail = `进程已退出（exitCode=${waitResult.code}）`;
       } else {
-        console.error(
-          `重启后健康检查失败（进程未退出但 HTTP 无响应），` +
-            `GiveUp app_id=${appId} port=${port}`,
-        );
+        detail = "进程未退出但 HTTP 无响应";
       }
+      if (health.lastError !== null) detail += `；最后一次请求错误: ${health.lastError}`;
+      if (health.lastStatus !== null) detail += `；最后一次响应状态: ${health.lastStatus}`;
+      console.error(
+        `重启后健康检查失败（${detail}），GiveUp app_id=${appId} port=${port}`,
+      );
+      // 记录具体原因供 API 层透传给 agent（503 响应）
+      this.lastRestartFailure.set(appId, `健康检查失败: ${detail}`);
       try {
         await this.stop(appId);
       } catch {

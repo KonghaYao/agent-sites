@@ -584,8 +584,12 @@ async function handleProxyWithRecovery(
       `flush apps.json 失败（status=Error 未持久化） error=${(e as Error).message}`,
     );
   }
+  // 透传具体失败原因（PM.lastRestartFailure 在 GiveUp 时记录），
+  // 避免 agent 只拿到笼统的「健康检查超时或端口冲突」
+  const detail = state.processManager.lastRestartFailure.get(appId);
+  const detailSuffix = detail ? ` 详情: ${detail}` : "";
   throw AppError.ServiceUnavailable(
-    `App ${appId} 后端多次重启失败，已停止自愈（${reason}）`,
+    `App ${appId} 后端多次重启失败，已停止自愈（${reason}）${detailSuffix}`,
   );
 }
 
